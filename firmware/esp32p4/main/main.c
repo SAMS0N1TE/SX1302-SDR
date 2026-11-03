@@ -1,0 +1,403 @@
+/* SX1302 (Seeed WM1302 in a Heltec HT-HC01P debug board) on the ESP32-P4-NANO.
+   Semtech sx1302_hal runs unchanged over a spidev shim. Console on UART0.
+
+   Wiring (debug-board header -> Nano):
+     CLK  -> GPIO2    MISO -> GPIO3    MOSI -> GPIO6    CS -> GPIO53
+     RESET (SX1302_RESET, active high) -> GPIO23
+     INT   (SX1262_RESET, active low)  -> GPIO22, held low (its CSN is not broken out)
+
+   Commands: see help. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
+#include "esp_timer.h"
+#include "esp_rom_crc.h"
+#include "esp_rom_sys.h"
+#include "loragw_hal.h"
+#include "loragw_reg.h"
+#include "loragw_com.h"
+#include "loragw_aux.h"
+#include "esp_spidev_cfg.h"
+
+#define PIN_SCK   2
+#define PIN_MOSI  6
+#define PIN_MISO  3
+#define PIN_CS    53
+#define PIN_RST   23
+#define PIN_1262_RST 22
+
+#define CAP_SIZE 0x4000
+
+static const uint32_t s_fs[32] = {4e6, 4e6, 4e6, 4e6, 4e6, 4e6, 4e6, 0, 0, 1e6, 125e3, 125e3, 125e3, 125e3, 125e3, 125e3, 125e3, 125e3, 8e6, 125e3, 125e3, 125e3, 0, 32e6, 32e6, 0, 32e6, 32e6, 0, 32e6, 32e6, 32e6};
+static uint8_t s_buf[CAP_SIZE];
+static uint32_t s_rf0 = 904300000, s_rf1 = 905000000;
+static int s_started;
+
+static void hw_reset(void)
+{
+    gpio_config_t g = { .pin_bit_mask = (1ULL << PIN_RST) | (1ULL << PIN_1262_RST), .mode = GPIO_MODE_OUTPUT };
+    gpio_config(&g);
+    gpio_set_level(PIN_1262_RST, 0);
+    gpio_set_level(PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static int read_version(void)
+{
+    int32_t v = -1;
+    if (lgw_reg_r(SX1302_REG_COMMON_VERSION_VERSION, &v) != LGW_REG_SUCCESS) return -1;
+    return (int)v;
+}
+
+static int configure(void)
+{
+    struct lgw_conf_board_s b = {0};
+    b.lorawan_public = true;
+    b.clksrc = 0;
+    b.full_duplex = false;
+    b.com_type = LGW_COM_SPI;
+    strcpy(b.com_path, "/dev/spidev0.0");
+    if (lgw_board_setconf(&b) != LGW_HAL_SUCCESS) return -1;
+
+    struct lgw_conf_rxrf_s rf = {0};
+    rf.enable = true;
+    rf.type = LGW_RADIO_TYPE_SX1250;
+    rf.rssi_offset = -215.4f;
+    rf.freq_hz = s_rf0;
+    rf.tx_enable = true;
+    if (lgw_rxrf_setconf(0, &rf) != LGW_HAL_SUCCESS) return -2;
+    rf.freq_hz = s_rf1;
+    rf.tx_enable = false;
+    if (lgw_rxrf_setconf(1, &rf) != LGW_HAL_SUCCESS) return -3;
+
+    static const int32_t ifs[8] = {-400000, -200000, 0, -400000, -200000, 0, 200000, 400000};
+    static const uint8_t rfc[8] = {0, 0, 0, 1, 1, 1, 1, 1};
+    for (int i = 0; i < 8; i++) {
+        struct lgw_conf_rxif_s ifc = {0};
+        ifc.enable = true;
+        ifc.rf_chain = rfc[i];
+        ifc.freq_hz = ifs[i];
+        if (lgw_rxif_setconf(i, &ifc) != LGW_HAL_SUCCESS) return -10 - i;
+    }
+    return 0;
+}
+
+static int do_start(void)
+{
+    int e = configure();
+    if (e) { printf("configure failed %d\n", e); return e; }
+    int64_t t0 = esp_timer_get_time();
+    e = lgw_start();
+    printf("lgw_start -> %d in %lld ms\n", e, (esp_timer_get_time() - t0) / 1000);
+    s_started = (e == LGW_HAL_SUCCESS);
+    return e;
+}
+
+/* One-shot capture into s_buf, as test_loragw_capture_ram.c does. */
+static int capture(int src, int wrap)
+{
+    uint32_t fs = s_fs[src & 31];
+    uint16_t period = fs ? (uint16_t)(32e6 / fs - 1) : 0;
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_ENABLE, 1);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, wrap);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_SOURCE_A_SOURCEMUX, src);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_0_CAPTUREPERIOD, period & 0xFF);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_1_CAPTUREPERIOD, (period >> 8) & 0xFF);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 1);
+    if (wrap) return 0;
+    /* Stay off the SPI bus while the RAM fills; SPI edges couple into the receiver. */
+    if (fs) {
+        uint32_t us = (uint32_t)(4096.0 * 1e6 / fs) + 500;
+        if (us > 3000) vTaskDelay(pdMS_TO_TICKS(us / 1000 + 1));
+        else esp_rom_delay_us(us);
+    }
+    int32_t done = 0;
+    int64_t t0 = esp_timer_get_time();
+    while (!done && esp_timer_get_time() - t0 < 500000) {
+        lgw_reg_r(SX1302_REG_CAPTURE_RAM_STATUS_CAPCOMPLETE, &done);
+    }
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
+    if (!done) return -1;
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+    int e = lgw_mem_rb(0, s_buf, CAP_SIZE, false);
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+    return e;
+}
+
+static void stats(int src)
+{
+    int fmt16 = (src >= 2 && src <= 6) || src == 9;
+    int fmt8 = (src >= 10 && src <= 17);
+    double si = 0, sq = 0, pi = 0, pq = 0;
+    int n = CAP_SIZE / 4, distinct = 0, changes = 0;
+    uint32_t prev = 0;
+    for (int i = 0; i < CAP_SIZE; i += 4) {
+        double I, Q;
+        if (fmt8) { I = (int8_t)s_buf[i + 3]; Q = (int8_t)s_buf[i + 1]; }
+        else { I = (int16_t)(s_buf[i + 2] | s_buf[i + 3] << 8); Q = (int16_t)(s_buf[i] | s_buf[i + 1] << 8); }
+        si += I; sq += Q; pi += I * I; pq += Q * Q;
+        uint32_t w = s_buf[i] | s_buf[i + 1] << 8 | s_buf[i + 2] << 16 | (uint32_t)s_buf[i + 3] << 24;
+        if (i && w != prev) changes++;
+        prev = w;
+    }
+    /* distinct 32-bit words among the first 256 */
+    for (int a = 0; a < 256; a++) {
+        uint32_t wa; memcpy(&wa, s_buf + a * 4, 4);
+        int seen = 0;
+        for (int b = 0; b < a && !seen; b++) { uint32_t wb; memcpy(&wb, s_buf + b * 4, 4); seen = (wa == wb); }
+        distinct += !seen;
+    }
+    si /= n; sq /= n;
+    double ri = sqrt(pi / n - si * si), rq = sqrt(pq / n - sq * sq);
+    printf("src %2d fs %8lu %s meanI %8.1f meanQ %8.1f rmsI %8.1f rmsQ %8.1f chg %4d/%d dist256 %3d  w0..3 %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+           src, (unsigned long)s_fs[src], fmt8 ? "i8 " : fmt16 ? "i16" : "raw", si, sq, ri, rq, changes, n - 1, distinct,
+           s_buf[3], s_buf[2], s_buf[1], s_buf[0], s_buf[7], s_buf[6], s_buf[5], s_buf[4],
+           s_buf[11], s_buf[10], s_buf[9], s_buf[8], s_buf[15], s_buf[14], s_buf[13], s_buf[12]);
+}
+
+static void b64_dump(int src)
+{
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    printf("B64BEGIN %d %lu %u %lu %lu\n", src, (unsigned long)s_fs[src], CAP_SIZE, (unsigned long)s_rf0, (unsigned long)s_rf1);
+    char line[80];
+    int col = 0;
+    for (int i = 0; i < CAP_SIZE; i += 3) {
+        uint32_t v = s_buf[i] << 16 | (i + 1 < CAP_SIZE ? s_buf[i + 1] << 8 : 0) | (i + 2 < CAP_SIZE ? s_buf[i + 2] : 0);
+        line[col++] = t[(v >> 18) & 63];
+        line[col++] = t[(v >> 12) & 63];
+        line[col++] = i + 1 < CAP_SIZE ? t[(v >> 6) & 63] : '=';
+        line[col++] = i + 2 < CAP_SIZE ? t[v & 63] : '=';
+        if (col >= 76) { line[col] = 0; puts(line); col = 0; }
+    }
+    if (col) { line[col] = 0; puts(line); }
+    puts("B64END");
+}
+
+static void ring(int src, int polls, int us)
+{
+    if (capture(src, 1)) { puts("ring start failed"); return; }
+    int64_t t0 = esp_timer_get_time();
+    int32_t lo = 0, hi = 0, done = 0, plo = -1, phi = -1;
+    for (int i = 0; i < polls; i++) {
+        lgw_reg_r(SX1302_REG_CAPTURE_RAM_LAST_RAM_ADDR_0_LASTRAMADDR, &lo);
+        lgw_reg_r(SX1302_REG_CAPTURE_RAM_LAST_RAM_ADDR_1_LASTRAMADDR, &hi);
+        lgw_reg_r(SX1302_REG_CAPTURE_RAM_STATUS_CAPCOMPLETE, &done);
+        if (lo != plo || hi != phi || i == 0 || i == polls - 1)
+            printf("t %7lld us  addr0 0x%02lX addr1 0x%02lX  done %ld\n", esp_timer_get_time() - t0, (long)lo, (long)hi, (long)done);
+        plo = lo; phi = hi;
+        if (us) esp_rom_delay_us(us);
+    }
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
+}
+
+/* 12-bit capture-RAM write pointer (word index). Read hi/lo/hi to avoid tearing. */
+#define REG_LASTRAMADDR 0x6006 /* lo byte, then hi nibble at 0x6007 */
+#define RING_WORDS 4096
+
+static int ring_wptr(void)
+{
+    uint8_t a[2], b[2];
+    for (int tries = 0; tries < 4; tries++) {
+        if (lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, REG_LASTRAMADDR, a, 2)) return -1;
+        if (lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, REG_LASTRAMADDR, b, 2)) return -1;
+        int wa = ((a[1] & 15) << 8) | a[0], wb = ((b[1] & 15) << 8) | b[0];
+        int d = (wb - wa) & (RING_WORDS - 1);
+        if (d < 512) return wb;   /* both reads agree to within normal motion */
+    }
+    return -2;
+}
+
+/* Continuous read of the capture ring in wrap mode. Reads [rd, wptr) each
+   pass; a lap is flagged when the time since the last read implies the
+   writer could have overtaken us (> ring size minus a margin). */
+static uint8_t s_chunk[RING_WORDS * 4];
+static void stream(int src, int ms)
+{
+    uint32_t fs = s_fs[src & 31];
+    if (!fs) { puts("no fs for that source"); return; }
+    if (capture(src, 1)) { puts("ring start failed"); return; }
+    int rd = ring_wptr();
+    int64_t t0 = esp_timer_get_time(), tlast = t0, tspi = 0, tread = t0;
+    long long words = 0, reads = 0, laps = 0, bad = 0, bogus = 0;
+    int maxav = 0;
+    double p = 0;
+    long long np = 0;
+    int fmt8 = (src >= 10 && src <= 17);
+    /* Phase continuity: with a CW tone every step arg(x[n] conj x[n-1]) is the
+       same; a lost/duplicated sample at a read boundary shows as a jump. */
+    float pI = 0, pQ = 0, ref = 0;
+    int have_prev = 0, have_ref = 0;
+    long long jumps_in = 0, jumps_edge = 0, steps = 0;
+    double step_sum = 0;
+    while (esp_timer_get_time() - t0 < (int64_t)ms * 1000) {
+        int w = ring_wptr();               /* page 0 */
+        if (w < 0) { bad++; continue; }
+        int64_t now = esp_timer_get_time();
+        int av = (w - rd) & (RING_WORDS - 1);
+        double expect = (double)(now - tread) * fs / 1e6;  /* words written since our last read */
+        if ((double)(now - tlast) * fs / 1e6 > RING_WORDS - 256) laps++;
+        tlast = now;
+        if (av < 32) continue;
+        if (av > expect * 1.25 + 64) { bogus++; continue; }  /* pointer went backwards or jumped */
+        if (av > maxav) maxav = av;
+        int64_t ts = esp_timer_get_time();
+        int first = av;
+        if (rd + first > RING_WORDS) first = RING_WORDS - rd;
+        lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+        lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, (uint16_t)(rd * 4), s_chunk, (uint16_t)(first * 4));
+        if (first < av)
+            lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, 0, s_chunk + first * 4, (uint16_t)((av - first) * 4));
+        lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+        tread = now;
+        tspi += esp_timer_get_time() - ts;
+        for (int i = 0; i < av * 4; i += 4) {
+            double I, Q;
+            if (fmt8) { I = (int8_t)s_chunk[i + 3]; Q = (int8_t)s_chunk[i + 1]; }
+            else { I = (int16_t)(s_chunk[i + 2] | s_chunk[i + 3] << 8); Q = (int16_t)(s_chunk[i] | s_chunk[i + 1] << 8); }
+            p += I * I + Q * Q; np++;
+            if (have_prev) {
+                float re = (float)I * pI + (float)Q * pQ, im = (float)Q * pI - (float)I * pQ;
+                float st = atan2f(im, re);
+                if (!have_ref && steps > 256) { ref = (float)(step_sum / steps); have_ref = 1; }
+                if (have_ref) {
+                    float d = fabsf(st - ref);
+                    if (d > (float)M_PI) d = 2.0f * (float)M_PI - d;
+                    if (d > 0.6f) { if (i == 0) jumps_edge++; else jumps_in++; }
+                }
+                step_sum += st; steps++;
+            }
+            pI = (float)I; pQ = (float)Q; have_prev = 1;
+        }
+        rd = (rd + av) & (RING_WORDS - 1);
+        words += av; reads++;
+    }
+    int64_t dt = esp_timer_get_time() - t0;
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
+    printf("stream src %d fs %lu spi %d Hz: %lld words in %lld ms = %.1f kS/s (%.1f%% of fs), reads %lld, max avail %d, laps %lld, bogus %lld, bad ptr %lld, spi busy %.0f%%, mean |iq|^2 %.1f\n",
+           src, (unsigned long)fs, espdev_get_speed(), words, dt / 1000, words * 1000.0 / dt, words * 1e8 / dt / fs, reads, maxav, laps, bogus, bad,
+           tspi * 100.0 / dt, np ? p / np : 0);
+    if (steps) {
+        double mean = step_sum / steps;
+        printf("phase: mean step %.4f rad = %+.1f Hz, jumps >0.6 rad: %lld at read edges (of %lld edges), %lld inside\n",
+               mean, mean * fs / (2 * M_PI), jumps_edge, reads, jumps_in);
+    }
+}
+
+static void spi_bench(void)
+{
+    int64_t t0 = esp_timer_get_time();
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+    int e = lgw_mem_rb(0, s_buf, CAP_SIZE, false);
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+    int64_t dt = esp_timer_get_time() - t0;
+    printf("spi %d Hz: 16 KB read %lld us (%.2f Mb/s) err %d, crc %08lX, version 0x%02X\n", espdev_get_speed(), dt,
+           CAP_SIZE * 8.0 / dt, e, (unsigned long)esp_rom_crc32_le(0, s_buf, CAP_SIZE), read_version());
+}
+
+static void handle(char *line)
+{
+    char *argv[6] = {0};
+    int argc = 0;
+    for (char *p = strtok(line, " \t\r\n"); p && argc < 6; p = strtok(NULL, " \t\r\n")) argv[argc++] = p;
+    if (!argc) return;
+    const char *c = argv[0];
+    if (!strcmp(c, "help")) {
+        puts("ver | start | stop | tune <hz0> [hz1] | spi <hz> | cap <src> [b64] | sweep | ring <src> [polls] [us] | rd <addr> | wr <addr> <val> | rdb <addr> <n>");
+    } else if (!strcmp(c, "ver")) {
+        int v = read_version();
+        printf("SX1302 version 0x%02X (v%d.%d)\n", v & 0xFF, (v >> 4) & 15, v & 15);
+    } else if (!strcmp(c, "start")) {
+        do_start();
+    } else if (!strcmp(c, "stop")) {
+        printf("lgw_stop -> %d\n", lgw_stop());
+        s_started = 0;
+    } else if (!strcmp(c, "tune") && argc >= 2) {
+        s_rf0 = strtoul(argv[1], NULL, 0);
+        s_rf1 = argc >= 3 ? strtoul(argv[2], NULL, 0) : s_rf0 + 700000;
+        if (s_started) { lgw_stop(); s_started = 0; }
+        hw_reset();
+        do_start();
+    } else if (!strcmp(c, "spi") && argc >= 2) {
+        int e = espdev_set_speed(atoi(argv[1]));
+        if (e) printf("set speed failed %d\n", e);
+        spi_bench();
+    } else if (!strcmp(c, "cap") && argc >= 2) {
+        int src = atoi(argv[1]) & 31;
+        int64_t t0 = esp_timer_get_time();
+        int e = capture(src, 0);
+        printf("capture %d -> %d in %lld us\n", src, e, esp_timer_get_time() - t0);
+        if (!e) { stats(src); if (argc >= 3) b64_dump(src); }
+    } else if (!strcmp(c, "sweep")) {
+        for (int s = 0; s < 32; s++) {
+            if (!s_fs[s]) { printf("src %2d fs 0 (skipped)\n", s); continue; }
+            if (capture(s, 0)) printf("src %2d capture timeout\n", s);
+            else stats(s);
+        }
+    } else if (!strcmp(c, "ring") && argc >= 2) {
+        ring(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 200, argc >= 4 ? atoi(argv[3]) : 0);
+    } else if (!strcmp(c, "stream") && argc >= 2) {
+        stream(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 2000);
+    } else if (!strcmp(c, "rd") && argc >= 2) {
+        uint8_t v = 0;
+        int e = lgw_com_r(LGW_SPI_MUX_TARGET_SX1302, (uint16_t)strtoul(argv[1], NULL, 0), &v);
+        printf("rd 0x%04lX = 0x%02X (%d)\n", strtoul(argv[1], NULL, 0), v, e);
+    } else if (!strcmp(c, "wr") && argc >= 3) {
+        int e = lgw_com_w(LGW_SPI_MUX_TARGET_SX1302, (uint16_t)strtoul(argv[1], NULL, 0), (uint8_t)strtoul(argv[2], NULL, 0));
+        printf("wr -> %d\n", e);
+    } else if (!strcmp(c, "rdb") && argc >= 3) {
+        uint16_t a = (uint16_t)strtoul(argv[1], NULL, 0);
+        int n = atoi(argv[2]);
+        if (n > 256) n = 256;
+        uint8_t b[256];
+        int e = lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, a, b, (uint16_t)n);
+        printf("rdb 0x%04X x%d (%d):", a, n, e);
+        for (int i = 0; i < n; i++) printf("%s%02X", i % 16 ? " " : "\n  ", b[i]);
+        printf("\n");
+    } else {
+        puts("unknown, try help");
+    }
+}
+
+void app_main(void)
+{
+    uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0);
+    uart_vfs_dev_use_driver(UART_NUM_0);
+    setvbuf(stdin, NULL, _IONBF, 0);
+
+    printf("\nsx1302-p4: WM1302 via Heltec debug board, HAL %s\n", LIBLORAGW_VERSION);
+    hw_reset();
+    int e = espdev_setup(SPI2_HOST, PIN_SCK, PIN_MOSI, PIN_MISO, PIN_CS, 2000000);
+    printf("spi setup -> %d\n", e);
+    e = lgw_connect(LGW_COM_SPI, "/dev/spidev0.0");
+    printf("lgw_connect -> %d\n", e);
+    int v = read_version();
+    printf("SX1302 version 0x%02X\n", v & 0xFF);
+    /* lgw_start opens the link itself */
+    lgw_disconnect();
+    do_start();
+    espdev_set_speed(16000000);  /* reads verified bit-exact to 20 MHz on dupont wires */
+    puts("ready: sweep | cap <src> [b64] | ring <src> | stream <src> [ms] | spi <hz> | tune <hz0> [hz1]");
+
+    char line[128];
+    int n = 0;
+    for (;;) {
+        int ch = fgetc(stdin);
+        if (ch == EOF) { vTaskDelay(1); continue; }
+        if (ch == '\r' || ch == '\n') {
+            if (n) { line[n] = 0; printf("> %s\n", line); handle(line); n = 0; }
+        } else if (n < (int)sizeof line - 1) {
+            line[n++] = (char)ch;
+        }
+    }
+}
