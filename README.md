@@ -7,12 +7,13 @@ The SX1302 has a 16 KB capture RAM that its own HAL only uses for one-shot test 
 ## Results
 
 - Continuous 125 kS/s I/Q from any of the 8 LoRa channels, every sample delivered (10 s runs, 0 ring laps, 0 phase jumps at 16,132 SPI read boundaries).
+- Streams to a computer over the board's USB UART at 3 Mbaud: 1,249,918 samples in 10 s, 0 CRC, sequence or index errors.
 - 4 MS/s 16-bit I/Q snapshots from each SX1250 radio, 4096 samples each.
 - 1 MS/s snapshots from the radio A path.
 - A CW test tone shows on both radios at the correct offset, 45 dB above the noise wideband and 60 dB in a 125 kHz channel.
 - SPI reads bit-exact up to 20 MHz on jumper wires (the HAL uses 2 MHz).
 
-<p align="center"><img src="docs/images/tone-904330-captures.png" width="96%"></p>
+<p align="center"><img src="docs/images/tone-904330-captures.png" width="64%"> <img src="docs/images/waterfall-src12-tone.png" width="32%"></p>
 
 ## Hardware
 
@@ -62,6 +63,7 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 | `cap <src> [b64]` | one capture; `b64` dumps the 16 KB as base64 |
 | `ring <src> [polls] [us]` | wrap mode, prints the write pointer as it moves |
 | `stream <src> [ms]` | continuous ring read, reports rate, laps and phase continuity |
+| `pcstream <src> [ms] [baud]` | continuous ring read sent to the host, see [docs/stream-protocol.md](docs/stream-protocol.md) |
 | `tune <hz0> [hz1]` | restart with new radio frequencies |
 | `spi <hz>` | change SPI clock, time a 16 KB read |
 | `rd`, `wr`, `rdb` | raw register access |
@@ -70,6 +72,7 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 
 - `tools/sx1302_console.py PORT cmd [wait] ...` sends console commands.
 - `tools/sx1302_grab.py PORT OUTDIR src[:count] ...` pulls captures, saves `.npy` and spectrum plots.
+- `tools/sx1302_stream.py PORT SRC SECONDS [--png FILE]` records a continuous stream to `.cs8` or `.cs16` and draws a waterfall.
 
 ## How it works
 

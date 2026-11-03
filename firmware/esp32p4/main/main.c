@@ -221,18 +221,54 @@ static int ring_wptr(void)
    pass; a lap is flagged when the time since the last read implies the
    writer could have overtaken us (> ring size minus a margin). */
 static uint8_t s_chunk[RING_WORDS * 4];
-static void stream(int src, int ms)
+
+/* Binary I/Q frames to the host over UART0 (see docs/stream-protocol.md).
+   12-byte header: "SX", version, type, u16 seq, u16 len, u32 first sample
+   index; then payload; then CRC-32 over bytes 2..11+len. */
+#define FR_IQ8  0x10
+#define FR_IQ16 0x11
+#define FR_GAP  0x12
+#define FR_END  0x1F
+static uint8_t s_frame[12 + 4096 + 4];
+static uint16_t s_seq;
+
+static void put32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+
+static void send_frame(uint8_t type, uint32_t index, const uint8_t *pl, uint16_t len)
+{
+    s_frame[0] = 'S'; s_frame[1] = 'X'; s_frame[2] = 1; s_frame[3] = type;
+    s_frame[4] = s_seq; s_frame[5] = s_seq >> 8; s_seq++;
+    s_frame[6] = len; s_frame[7] = len >> 8;
+    put32(s_frame + 8, index);
+    if (pl != s_frame + 12 && len) memcpy(s_frame + 12, pl, len);
+    uint32_t crc = esp_rom_crc32_le(0, s_frame + 2, 10 + len);
+    put32(s_frame + 12 + len, crc);
+    uart_write_bytes(UART_NUM_0, s_frame, 16 + len);
+}
+
+static void stream(int src, int ms, int baud)
 {
     uint32_t fs = s_fs[src & 31];
     if (!fs) { puts("no fs for that source"); return; }
+    int fmt8 = (src >= 10 && src <= 17);
+    if (baud) {
+        printf("PCSTREAM %d %lu %d %s\n", src, (unsigned long)fs, baud, fmt8 ? "iq8" : "iq16");
+        fflush(stdout);
+        uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(200));
+        uart_set_baudrate(UART_NUM_0, baud);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        s_seq = 0;
+    }
     if (capture(src, 1)) { puts("ring start failed"); return; }
     int rd = ring_wptr();
+    uint32_t index = 0;
+    int64_t tuart = 0;
     int64_t t0 = esp_timer_get_time(), tlast = t0, tspi = 0, tread = t0;
     long long words = 0, reads = 0, laps = 0, bad = 0, bogus = 0;
     int maxav = 0;
     double p = 0;
     long long np = 0;
-    int fmt8 = (src >= 10 && src <= 17);
     /* Phase continuity: with a CW tone every step arg(x[n] conj x[n-1]) is the
        same; a lost/duplicated sample at a read boundary shows as a jump. */
     float pI = 0, pQ = 0, ref = 0;
@@ -245,7 +281,15 @@ static void stream(int src, int ms)
         int64_t now = esp_timer_get_time();
         int av = (w - rd) & (RING_WORDS - 1);
         double expect = (double)(now - tread) * fs / 1e6;  /* words written since our last read */
-        if ((double)(now - tlast) * fs / 1e6 > RING_WORDS - 256) laps++;
+        if ((double)(now - tlast) * fs / 1e6 > RING_WORDS - 256) {
+            /* Overrun: resync to the writer and tell the host how much was lost. */
+            laps++;
+            uint32_t lost = (uint32_t)expect;
+            if (baud) { uint8_t g[4]; put32(g, lost); send_frame(FR_GAP, index, g, 4); }
+            index += lost;
+            rd = w; tread = now; tlast = now; have_prev = 0;
+            continue;
+        }
         tlast = now;
         if (av < 32) continue;
         if (av > expect * 1.25 + 64) { bogus++; continue; }  /* pointer went backwards or jumped */
@@ -278,12 +322,45 @@ static void stream(int src, int ms)
             }
             pI = (float)I; pQ = (float)Q; have_prev = 1;
         }
+        if (baud) {
+            int64_t tu = esp_timer_get_time();
+            int per = fmt8 ? 2048 : 1024;        /* samples per frame, 4 KB max */
+            for (int s0 = 0; s0 < av; s0 += per) {
+                int n = av - s0 < per ? av - s0 : per;
+                uint8_t *o = s_frame + 12;
+                const uint8_t *in = s_chunk + s0 * 4;
+                if (fmt8) {
+                    for (int k = 0; k < n; k++) { o[2 * k] = in[4 * k + 3]; o[2 * k + 1] = in[4 * k + 1]; }
+                    send_frame(FR_IQ8, index + s0, s_frame + 12, (uint16_t)(n * 2));
+                } else {
+                    for (int k = 0; k < n; k++) {
+                        o[4 * k] = in[4 * k + 2]; o[4 * k + 1] = in[4 * k + 3];
+                        o[4 * k + 2] = in[4 * k]; o[4 * k + 3] = in[4 * k + 1];
+                    }
+                    send_frame(FR_IQ16, index + s0, s_frame + 12, (uint16_t)(n * 4));
+                }
+            }
+            tuart += esp_timer_get_time() - tu;
+        }
+        index += av;
         rd = (rd + av) & (RING_WORDS - 1);
         words += av; reads++;
     }
     int64_t dt = esp_timer_get_time() - t0;
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
+    if (baud) {
+        uint8_t e[24];
+        put32(e, (uint32_t)words); put32(e + 4, (uint32_t)(words >> 32));
+        put32(e + 8, (uint32_t)laps); put32(e + 12, (uint32_t)bogus);
+        put32(e + 16, (uint32_t)(dt / 1000)); put32(e + 20, fs);
+        send_frame(FR_END, index, e, sizeof e);
+        uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(300));
+        uart_set_baudrate(UART_NUM_0, 115200);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        printf("uart busy %.0f%%\n", tuart * 100.0 / dt);
+    }
     printf("stream src %d fs %lu spi %d Hz: %lld words in %lld ms = %.1f kS/s (%.1f%% of fs), reads %lld, max avail %d, laps %lld, bogus %lld, bad ptr %lld, spi busy %.0f%%, mean |iq|^2 %.1f\n",
            src, (unsigned long)fs, espdev_get_speed(), words, dt / 1000, words * 1000.0 / dt, words * 1e8 / dt / fs, reads, maxav, laps, bogus, bad,
            tspi * 100.0 / dt, np ? p / np : 0);
@@ -313,7 +390,8 @@ static void handle(char *line)
     if (!argc) return;
     const char *c = argv[0];
     if (!strcmp(c, "help")) {
-        puts("ver | start | stop | tune <hz0> [hz1] | spi <hz> | cap <src> [b64] | sweep | ring <src> [polls] [us] | rd <addr> | wr <addr> <val> | rdb <addr> <n>");
+        puts("ver | start | stop | tune <hz0> [hz1] | spi <hz> | cap <src> [b64] | sweep | ring <src> [polls] [us]\n"
+             "stream <src> [ms] | pcstream <src> [ms] [baud] | rd <addr> | wr <addr> <val> | rdb <addr> <n>");
     } else if (!strcmp(c, "ver")) {
         int v = read_version();
         printf("SX1302 version 0x%02X (v%d.%d)\n", v & 0xFF, (v >> 4) & 15, v & 15);
@@ -347,7 +425,9 @@ static void handle(char *line)
     } else if (!strcmp(c, "ring") && argc >= 2) {
         ring(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 200, argc >= 4 ? atoi(argv[3]) : 0);
     } else if (!strcmp(c, "stream") && argc >= 2) {
-        stream(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 2000);
+        stream(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 2000, 0);
+    } else if (!strcmp(c, "pcstream") && argc >= 2) {
+        stream(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 10000, argc >= 4 ? atoi(argv[3]) : 3000000);
     } else if (!strcmp(c, "rd") && argc >= 2) {
         uint8_t v = 0;
         int e = lgw_com_r(LGW_SPI_MUX_TARGET_SX1302, (uint16_t)strtoul(argv[1], NULL, 0), &v);
@@ -371,7 +451,7 @@ static void handle(char *line)
 
 void app_main(void)
 {
-    uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0);
+    uart_driver_install(UART_NUM_0, 2048, 65536, 0, NULL, 0);
     uart_vfs_dev_use_driver(UART_NUM_0);
     setvbuf(stdin, NULL, _IONBF, 0);
 
