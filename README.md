@@ -14,6 +14,7 @@ The SX1302 has a 16 KB capture RAM that its own HAL only uses for one-shot test 
 - Two sources at once: both radios at 4 MS/s, or two channels, sampled at the same instants.
 - A CW test tone shows on both radios at the correct offset, 45 dB above the noise wideband and 60 dB in a 125 kHz channel.
 - SPI reads bit-exact up to 20 MHz on jumper wires (the HAL uses 2 MHz).
+- The chip's AGC and ARB MCUs run the PIC16 instruction set. A test program of ours runs on the AGC MCU at 16 million instruction cycles per second, see [research/mcu](research/mcu/README.md).
 
 <p align="center"><img src="docs/images/tone-904330-captures.png" width="64%"> <img src="docs/images/waterfall-src12-tone.png" width="32%"></p>
 
@@ -69,6 +70,7 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 | `chunk [n]`, `burst [bytes] [gap_us] [page]` | stream read pattern |
 | `capx <src> <load> [b64]`, `capxsize <bytes>` | one-shot capture with SPI load during the fill |
 | `cap2 <a> <b> [b64]` | one-shot capture of two sources (2k x 64) |
+| `mcutest [bit15]` | load a counter program into the AGC MCU and time it |
 | `tune <hz0> [hz1]` | restart with new radio frequencies |
 | `spi <hz>` | change SPI clock, time a 16 KB read |
 | `rd`, `wr`, `rdb` | raw register access |
@@ -79,6 +81,7 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 - `tools/sx1302_grab.py PORT OUTDIR src[:count] ...` pulls captures, saves `.npy` and spectrum plots.
 - `tools/sx1302_stream.py PORT SRC SECONDS [--png FILE]` records a continuous stream to `.cs8` or `.cs16` and draws a waterfall.
 - `tools/sx1302_cap2.py PORT A B` takes a two-source capture and reports both halves.
+- `tools/sx1302_mcu_disasm.py FILE.var [--stats]` disassembles an MCU image from the HAL.
 
 ## How it works
 

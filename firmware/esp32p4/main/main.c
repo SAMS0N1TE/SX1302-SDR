@@ -217,6 +217,56 @@ static int capture2(int sa, int sb)
     return e;
 }
 
+/* Load a small program into the AGC MCU (a PIC16-style core, 4096 x 14-bit
+   words; bit 14 of each stored word is even parity of bits 13:0, bit 15 is
+   not understood yet). The test program counts in file register 0x1B, which
+   the host reads as AGC status (0x5781):
+       000 CLRF 0x1B / 001 CLRF 0x22 / 002 DECFSZ 0x22,F / 003 GOTO 002
+       004 INCF 0x1B,F / 005 GOTO 002
+   One count every 256 x 3 + 3 = 771 instruction cycles. */
+static uint8_t s_img[8192];
+
+static uint16_t pic_word(uint16_t op, int b15)
+{
+    op &= 0x3FFF;
+    int p = __builtin_parity(op);
+    return op | (uint16_t)(p << 14) | (uint16_t)(b15 << 15);
+}
+
+static void mcu_test(int b15)
+{
+    static const uint16_t prog[] = {0x019B, 0x01A2, 0x0BA2, 0x2802, 0x0A9B, 0x2802};
+    for (int i = 0; i < 4096; i++) {
+        uint16_t w = i < (int)(sizeof prog / 2) ? pic_word(prog[i], b15) : pic_word(0x3FFF, 1);
+        s_img[2 * i] = w & 0xFF;
+        s_img[2 * i + 1] = w >> 8;
+    }
+    int32_t v = 0;
+    lgw_reg_w(SX1302_REG_AGC_MCU_CTRL_MCU_CLEAR, 1);
+    lgw_reg_w(SX1302_REG_AGC_MCU_CTRL_HOST_PROG, 1);
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+    lgw_mem_wb(0x0000, s_img, sizeof s_img);
+    lgw_mem_rb(0x0000, s_buf, sizeof s_img, false);
+    int same = !memcmp(s_img, s_buf, sizeof s_img);
+    lgw_reg_w(SX1302_REG_AGC_MCU_CTRL_HOST_PROG, 0);
+    lgw_reg_w(SX1302_REG_AGC_MCU_CTRL_MCU_CLEAR, 0);
+    lgw_reg_r(SX1302_REG_AGC_MCU_CTRL_PARITY_ERROR, &v);
+    printf("mcutest bit15=%d: readback %s, parity error %ld\n", b15, same ? "ok" : "MISMATCH", (long)v);
+    /* sample the status register, unwrap the 8-bit count */
+    int64_t t0 = esp_timer_get_time(), tl = t0;
+    int32_t s = 0, prev = -1;
+    long total = 0, changes = 0;
+    while (esp_timer_get_time() - t0 < 200000) {
+        lgw_reg_r(SX1302_REG_AGC_MCU_MCU_AGC_STATUS_MCU_AGC_STATUS, &s);
+        if (prev >= 0 && s != prev) { total += (s - prev) & 0xFF; changes++; tl = esp_timer_get_time(); }
+        if (prev < 0) printf("first status 0x%02lX\n", (long)s);
+        prev = s;
+    }
+    double dt = (tl - t0) / 1e6;
+    printf("status changed %ld times, %ld counts in %.3f s -> %.0f counts/s -> %.2f M instruction cycles/s\n",
+           changes, total, dt, dt > 0 ? total / dt : 0, dt > 0 ? total / dt * 771 / 1e6 : 0);
+}
+
 static void stats(int src)
 {
     int fmt16 = (src >= 2 && src <= 6) || src == 9;
@@ -604,6 +654,9 @@ static void handle(char *line)
         if (argc >= 3) s_gap_us = atoi(argv[2]);
         if (argc >= 4) s_page_per_burst = atoi(argv[3]) != 0;
         printf("burst %d bytes, gap %d us, page per burst %d\n", s_burst, s_gap_us, s_page_per_burst);
+    } else if (!strcmp(c, "mcutest")) {
+        mcu_test(argc >= 2 ? atoi(argv[1]) & 1 : 0);
+        puts("AGC MCU now runs the test program; 'tune 904300000 905000000' restores the gateway firmware");
     } else if (!strcmp(c, "cap2") && argc >= 3) {
         int sa = atoi(argv[1]) & 31, sb = atoi(argv[2]) & 31;
         int e = capture2(sa, sb);
