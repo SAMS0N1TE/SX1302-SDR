@@ -39,6 +39,17 @@ Measured with `lgw_start` running, radio A at 904.3 MHz and radio B at 905.0 MHz
 
 Word layout, little endian: bytes 2 and 3 are I, bytes 0 and 1 are Q for the 16-bit sources. For the 8-bit channel sources I is byte 3 and Q is byte 1.
 
+## Two sources
+
+With RAMCONFIG 1 the RAM holds 2048 words of 64 bits. Bits 31:0 come from SOURCE_A and bits 63:32 from SOURCE_B, sampled together at SOURCE_A's period. `cap2 <a> <b>` and `tools/sx1302_cap2.py` read it.
+
+| Pair | Result |
+| --- | --- |
+| 12, 12 | both halves identical |
+| 12, 13 | channel 2 (CW at +30.0 kHz) and channel 3, same instants |
+| 2, 3 | radio A (CW at +29.3 kHz) and radio B (CW at -669.9 kHz) at 4 MS/s, 2048 samples each |
+| 9, 12 | channel 12 sampled at 1 MHz, each value held for 8 samples |
+
 ## Ring mode
 
 With CAPTUREWRAP set, the write pointer free-runs at the source rate and wraps every 4096 words. CAPCOMPLETE stays 0.

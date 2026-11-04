@@ -187,6 +187,36 @@ static int capture_load(int src, int mode)
     return e;
 }
 
+/* One-shot capture in 2k x 64 mode with two sources. */
+static int capture2(int sa, int sb)
+{
+    uint32_t fs = s_fs[sa & 31];
+    if (!fs) return -1;
+    uint16_t period = (uint16_t)(32e6 / fs - 1);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_ENABLE, 1);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, 1);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_SOURCE_A_SOURCEMUX, sa);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_SOURCE_B_SOURCEMUX, sb);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_0_CAPTUREPERIOD, period & 0xFF);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_1_CAPTUREPERIOD, (period >> 8) & 0xFF);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 1);
+    uint32_t us = (uint32_t)(4096.0 * 1e6 / fs) + 500;
+    if (us > 3000) vTaskDelay(pdMS_TO_TICKS(us / 1000 + 1)); else esp_rom_delay_us(us);
+    int32_t done = 0;
+    int64_t t0 = esp_timer_get_time();
+    while (!done && esp_timer_get_time() - t0 < 500000) lgw_reg_r(SX1302_REG_CAPTURE_RAM_STATUS_CAPCOMPLETE, &done);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_SOURCE_B_SOURCEMUX, 0);
+    printf("cap2 %d %d: done %ld after %lld us\n", sa, sb, (long)done, esp_timer_get_time() - t0 + us);
+    if (!done) return -2;
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+    int e = lgw_mem_rb(0, s_buf, CAP_SIZE, false);
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+    return e;
+}
+
 static void stats(int src)
 {
     int fmt16 = (src >= 2 && src <= 6) || src == 9;
@@ -574,6 +604,11 @@ static void handle(char *line)
         if (argc >= 3) s_gap_us = atoi(argv[2]);
         if (argc >= 4) s_page_per_burst = atoi(argv[3]) != 0;
         printf("burst %d bytes, gap %d us, page per burst %d\n", s_burst, s_gap_us, s_page_per_burst);
+    } else if (!strcmp(c, "cap2") && argc >= 3) {
+        int sa = atoi(argv[1]) & 31, sb = atoi(argv[2]) & 31;
+        int e = capture2(sa, sb);
+        if (!e && argc >= 4) b64_dump(sa);
+        else if (e) printf("cap2 failed %d\n", e);
     } else if (!strcmp(c, "capxsize") && argc >= 2) {
         int n = atoi(argv[1]);
         s_load_bytes = n < 4 ? 4 : n > 1024 ? 1024 : n;
