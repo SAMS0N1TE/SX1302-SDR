@@ -1,11 +1,12 @@
 """Pull capture RAM dumps from the SX1302-SDR firmware and plot them.
 
-usage: sx1302_grab.py PORT OUTDIR src[:count] ...
+usage: sx1302_grab.py PORT OUTDIR src[:count][@load] ...
 
 Runs 'cap <src> b64' count times per source, saves the samples as
 OUTDIR/srcNN.npy (complex64, one row per capture) and writes an averaged
-spectrum and a time plot to OUTDIR/srcNN.png. Needs numpy, matplotlib and
-pyserial."""
+spectrum and a time plot to OUTDIR/srcNN.png. With @load it runs
+'capx <src> <load> b64' instead (SPI load during the capture, see the
+firmware help). Needs numpy, matplotlib and pyserial."""
 import base64, os, sys, time
 import numpy as np
 import serial
@@ -17,8 +18,9 @@ port, out = sys.argv[1], sys.argv[2]
 os.makedirs(out, exist_ok=True)
 jobs = []
 for a in sys.argv[3:]:
+    a, _, mode = a.partition("@")
     s, _, n = a.partition(":")
-    jobs.append((int(s), int(n or 1)))
+    jobs.append((int(s), int(n or 1), int(mode) if mode else None))
 
 ser = serial.Serial(); ser.port = port; ser.baudrate = 115200; ser.timeout = 0.05
 ser.dtr = False; ser.rts = False
@@ -26,8 +28,9 @@ ser.open(); ser.reset_input_buffer()
 ser.write(b"\r\n"); time.sleep(0.5); ser.read(65536)
 
 
-def grab(src):
-    ser.write(f"cap {src} b64\r\n".encode())
+def grab(src, mode=None):
+    cmd = f"cap {src} b64" if mode is None else f"capx {src} {mode} b64"
+    ser.write((cmd + "\r\n").encode())
     buf = b""
     end = time.time() + 15
     while time.time() < end and b"B64END" not in buf:
@@ -54,15 +57,16 @@ def to_iq(src, raw):
     return i + 1j * q
 
 
-for src, n in jobs:
+for src, n, mode in jobs:
     caps = []
     for k in range(n):
-        fs, rf0, rf1, raw, stats = grab(src)
+        fs, rf0, rf1, raw, stats = grab(src, mode)
         iq = to_iq(src, raw)
         caps.append(iq)
         print(stats[0] if stats else f"src {src} capture {k}")
     iq_all = np.stack(caps)
-    np.save(os.path.join(out, f"src{src:02d}.npy"), iq_all.astype(np.complex64))
+    tag = f"src{src:02d}" + ("" if mode is None else f"_load{mode}")
+    np.save(os.path.join(out, tag + ".npy"), iq_all.astype(np.complex64))
     nfft = 1024
     win = np.hanning(nfft)
     segs = []
@@ -85,7 +89,7 @@ for src, n in jobs:
     ax[1].plot(t, caps[0].imag, lw=0.5, label="Q")
     ax[1].set_xlabel("ms"); ax[1].legend(); ax[1].grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(out, f"src{src:02d}.png"), dpi=110)
+    fig.savefig(os.path.join(out, tag + ".png"), dpi=110)
     plt.close(fig)
     pk = np.argmax(psd)
     print(f"  src {src}: psd span {psd.max() - np.median(psd):.1f} dB above median, peak at {f[pk]/1e3:+.1f} kHz")

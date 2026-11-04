@@ -6,7 +6,8 @@ The SX1302 has a 16 KB capture RAM that its own HAL only uses for one-shot test 
 
 ## Results
 
-- Continuous 125 kS/s I/Q from any of the 8 LoRa channels, every sample delivered (10 s runs, 0 ring laps, 0 phase jumps at 16,132 SPI read boundaries).
+- Continuous 125 kS/s I/Q from any of the 8 LoRa channels with no ring overruns (10 s runs, 0 laps, 0 phase jumps at 16,132 SPI read boundaries).
+- About 3% of streamed samples are writes the chip skipped while SPI was reading its RAM. The firmware detects each one and flags it as an erasure.
 - Streams to a computer over the board's USB UART at 3 Mbaud: 1,249,918 samples in 10 s, 0 CRC, sequence or index errors.
 - 4 MS/s 16-bit I/Q snapshots from each SX1250 radio, 4096 samples each.
 - 1 MS/s snapshots from the radio A path.
@@ -64,6 +65,8 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 | `ring <src> [polls] [us]` | wrap mode, prints the write pointer as it moves |
 | `stream <src> [ms]` | continuous ring read, reports rate, laps and phase continuity |
 | `pcstream <src> [ms] [baud]` | continuous ring read sent to the host, see [docs/stream-protocol.md](docs/stream-protocol.md) |
+| `chunk [n]`, `burst [bytes] [gap_us] [page]` | stream read pattern |
+| `capx <src> <load> [b64]`, `capxsize <bytes>` | one-shot capture with SPI load during the fill |
 | `tune <hz0> [hz1]` | restart with new radio frequencies |
 | `spi <hz>` | change SPI clock, time a 16 KB read |
 | `rd`, `wr`, `rdb` | raw register access |
@@ -81,6 +84,7 @@ See [docs/capture-ram.md](docs/capture-ram.md) for the capture sources, sample f
 ## Limits
 
 - Only channel taps (125 kS/s) stream continuously; 1 MS/s needs about 32 Mb/s of SPI reads.
+- Streams carry about 3% erasures (see [docs/capture-ram.md](docs/capture-ram.md#missed-writes-while-streaming)). Snapshots have none.
 - The module's SAW filters limit reception to its band (902 to 928 MHz on US915).
 - The 8-bit channel taps clip on strong signals.
 - SPI traffic couples into the receiver on jumper wires; keep the leads short.

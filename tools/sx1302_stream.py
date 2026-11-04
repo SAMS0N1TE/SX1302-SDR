@@ -46,6 +46,7 @@ samples = 0
 next_seq = None
 next_idx = 0
 endrec = None
+erasures = []
 t0 = time.time()
 deadline = t0 + a.seconds + 10
 while time.time() < deadline and endrec is None:
@@ -89,6 +90,9 @@ while time.time() < deadline and endrec is None:
             g = struct.unpack("<I", pl)[0]
             lost += g
             next_idx = (idx + g) & 0xFFFFFFFF
+        elif typ == 0x13:
+            s0, n = struct.unpack("<IH", pl)
+            erasures.append((s0, n))
         elif typ == 0x1F:
             endrec = struct.unpack("<QIIII", pl)
 f.close()
@@ -100,13 +104,19 @@ ser.close()
 
 print(f"file {out}: {samples} samples, {samples / fs:.3f} s at {fs} S/s")
 print(f"frames {frames}, crc errors {bad_crc}, seq errors {seq_err}, index errors {idx_err}, gaps {gaps} ({lost} samples lost)")
+erased = sum(n for _, n in erasures)
+print(f"erasures: {len(erasures)} runs, {erased} samples ({100.0 * erased / max(samples, 1):.3f}%), listed in {out}.erasures")
+with open(out + ".erasures", "w") as ef:
+    ef.write("# first_sample count (samples the chip did not write; they repeat the previous ring lap)\n")
+    for s0, n in erasures:
+        ef.write(f"{s0} {n}\n")
 if endrec:
     words, laps, bogus, dms, efs = endrec
     print(f"device: {words} samples in {dms} ms, laps {laps}, pointer glitches {bogus}; host got {100.0 * samples / max(words, 1):.3f}%")
 else:
     print("no END frame (stream cut short)")
 for l in tail.splitlines():
-    if l.startswith(("stream", "phase", "uart")):
+    if l.startswith(("stream", "phase", "uart", "stale:")):
         print("device: " + l)
 
 if a.png:

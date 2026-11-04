@@ -133,6 +133,60 @@ static int capture(int src, int wrap)
     return e;
 }
 
+/* One-shot capture with deliberate SPI load while the RAM fills:
+   mode 0 quiet, 1 single-register polls, 2 1 KB bursts from the RX buffer
+   (0x4000, page 0), 3 1 KB bursts from the capture RAM (page 1). */
+static uint8_t s_junk[1024];
+static int s_load_bytes = 1024;
+static int capture_load(int src, int mode)
+{
+    uint32_t fs = s_fs[src & 31];
+    if (!fs) return -1;
+    uint16_t period = (uint16_t)(32e6 / fs - 1);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_ENABLE, 1);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_SOURCE_A_SOURCEMUX, src);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_0_CAPTUREPERIOD, period & 0xFF);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_1_CAPTUREPERIOD, (period >> 8) & 0xFF);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 1);
+    int64_t t0 = esp_timer_get_time(), fill = (int64_t)(4096.0 * 1e6 / fs);
+    long n = 0;
+    while (esp_timer_get_time() - t0 < fill) {
+        uint8_t v;
+        if (mode == 1) lgw_com_r(LGW_SPI_MUX_TARGET_SX1302, 0x5606, &v);
+        else if (mode == 2) lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, 0x4000, s_junk, (uint16_t)s_load_bytes);
+        else if (mode == 3) {
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+            lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, 0x3C00, s_junk, (uint16_t)s_load_bytes);
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+        } else if (mode == 4) {
+            /* page 1 held for as long as a burst of s_load_bytes would take, no reads */
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+            esp_rom_delay_us((uint32_t)(s_load_bytes * 8LL * 1000000 / espdev_get_speed()));
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+            esp_rom_delay_us(100);
+        } else if (mode == 5) {
+            /* page 1, then 4-byte reads spread over the same time */
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+            for (int k = 0; k < s_load_bytes / 4; k++) lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, 0x3C00 + 4 * k, s_junk, 4);
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+            esp_rom_delay_us(100);
+        } else { esp_rom_delay_us(100); continue; }
+        n++;
+    }
+    int32_t done = 0;
+    int64_t t1 = esp_timer_get_time();
+    while (!done && esp_timer_get_time() - t1 < 200000) lgw_reg_r(SX1302_REG_CAPTURE_RAM_STATUS_CAPCOMPLETE, &done);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
+    if (!done) return -2;
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+    int e = lgw_mem_rb(0, s_buf, CAP_SIZE, false);
+    lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+    printf("capx src %d mode %d: %ld transactions during fill\n", src, mode, n);
+    return e;
+}
+
 static void stats(int src)
 {
     int fmt16 = (src >= 2 && src <= 6) || src == 9;
@@ -228,6 +282,7 @@ static uint8_t s_chunk[RING_WORDS * 4];
 #define FR_IQ8  0x10
 #define FR_IQ16 0x11
 #define FR_GAP  0x12
+#define FR_STALE 0x13
 #define FR_END  0x1F
 static uint8_t s_frame[12 + 4096 + 4];
 static uint16_t s_seq;
@@ -244,6 +299,48 @@ static void send_frame(uint8_t type, uint32_t index, const uint8_t *pl, uint16_t
     uint32_t crc = esp_rom_crc32_le(0, s_frame + 2, 10 + len);
     put32(s_frame + 12 + len, crc);
     uart_write_bytes(UART_NUM_0, s_frame, 16 + len);
+}
+
+/* chunk: samples to let accumulate before touching the SPI bus again.
+   Every SPI transaction during capture adds phase hash to the samples,
+   so the reader sleeps instead of polling the write pointer. */
+static int s_chunk_target = 1024;
+
+/* The capture engine does not write while SPI reads the capture RAM: samples
+   that arrive during a burst are lost and the pointer moves on. Keep each
+   burst short so the engine's buffer covers it. */
+static int s_burst = 1024, s_gap_us = 0;
+
+/* Page register 0x5600 holds only the 2-bit page; write it directly. With
+   s_page_per_burst set, page 1 is selected around each burst only. */
+static int s_page_per_burst = 0;
+#define REG_PAGE 0x5600
+
+static void ring_read(int word, uint8_t *dst, int words)
+{
+    int bytes = words * 4, addr = word * 4;
+    if (!s_page_per_burst) lgw_com_w(LGW_SPI_MUX_TARGET_SX1302, REG_PAGE, 1);
+    while (bytes > 0) {
+        int n = bytes < s_burst ? bytes : s_burst;
+        if (s_page_per_burst) lgw_com_w(LGW_SPI_MUX_TARGET_SX1302, REG_PAGE, 1);
+        lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, (uint16_t)addr, dst, (uint16_t)n);
+        if (s_page_per_burst) lgw_com_w(LGW_SPI_MUX_TARGET_SX1302, REG_PAGE, 0);
+        addr += n; dst += n; bytes -= n;
+        if (bytes > 0 && s_gap_us) esp_rom_delay_us(s_gap_us);
+    }
+    if (!s_page_per_burst) lgw_com_w(LGW_SPI_MUX_TARGET_SX1302, REG_PAGE, 0);
+}
+
+/* A write the engine missed leaves the word from one lap earlier, so a word
+   equal to the one read at the same position last lap is counted as stale. */
+static uint32_t s_lap[RING_WORDS];
+static uint32_t s_stale_mod[64], s_stale_off[64], s_runs[32];
+
+static void print_hist(const char *name, const uint32_t *h, int n)
+{
+    printf("%s:", name);
+    for (int i = 0; i < n; i++) if (h[i]) printf(" %d:%lu", i, (unsigned long)h[i]);
+    printf("\n");
 }
 
 static void stream(int src, int ms, int baud)
@@ -263,6 +360,13 @@ static void stream(int src, int ms, int baud)
     if (capture(src, 1)) { puts("ring start failed"); return; }
     int rd = ring_wptr();
     uint32_t index = 0;
+    memset(s_lap, 0xA5, sizeof s_lap);
+    memset(s_stale_mod, 0, sizeof s_stale_mod);
+    memset(s_stale_off, 0, sizeof s_stale_off);
+    memset(s_runs, 0, sizeof s_runs);
+    long long stale = 0, laps_seen = 0;
+    int run = 0;
+    (void)laps_seen;
     int64_t tuart = 0;
     int64_t t0 = esp_timer_get_time(), tlast = t0, tspi = 0, tread = t0;
     long long words = 0, reads = 0, laps = 0, bad = 0, bogus = 0;
@@ -276,6 +380,9 @@ static void stream(int src, int ms, int baud)
     long long jumps_in = 0, jumps_edge = 0, steps = 0;
     double step_sum = 0;
     while (esp_timer_get_time() - t0 < (int64_t)ms * 1000) {
+        int64_t wait_us = (int64_t)((double)s_chunk_target * 1e6 / fs) - (esp_timer_get_time() - tread);
+        if (wait_us > 1500) { vTaskDelay(pdMS_TO_TICKS(wait_us / 1000)); continue; }
+        if (wait_us > 0) esp_rom_delay_us((uint32_t)wait_us);
         int w = ring_wptr();               /* page 0 */
         if (w < 0) { bad++; continue; }
         int64_t now = esp_timer_get_time();
@@ -297,13 +404,39 @@ static void stream(int src, int ms, int baud)
         int64_t ts = esp_timer_get_time();
         int first = av;
         if (rd + first > RING_WORDS) first = RING_WORDS - rd;
-        lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
-        lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, (uint16_t)(rd * 4), s_chunk, (uint16_t)(first * 4));
-        if (first < av)
-            lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, 0, s_chunk + first * 4, (uint16_t)((av - first) * 4));
-        lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+        ring_read(rd, s_chunk, first);
+        if (first < av) ring_read(0, s_chunk + first * 4, av - first);
         tread = now;
         tspi += esp_timer_get_time() - ts;
+        int run_start = -1;
+        for (int k = 0; k <= av; k++) {
+            int is_stale = 0;
+            if (k < av) {
+                int pos = (rd + k) & (RING_WORDS - 1);
+                uint32_t wv; memcpy(&wv, s_chunk + 4 * k, 4);
+                is_stale = words + k >= RING_WORDS && wv == s_lap[pos];
+                s_lap[pos] = wv;
+                if (is_stale) {
+                    stale++;
+                    s_stale_mod[pos & 63]++;
+                    s_stale_off[k < 63 ? k : 63]++;
+                    if (run_start < 0) run_start = k;
+                    run++;
+                }
+            }
+            if (!is_stale && run) {
+                s_runs[run < 31 ? run : 31]++;
+                if (baud) {
+                    /* erasure: these samples are left over from the previous lap */
+                    uint8_t e[6];
+                    put32(e, index + run_start); e[4] = run; e[5] = run >> 8;
+                    send_frame(FR_STALE, index + run_start, e, 6);
+                }
+                run = 0;
+                run_start = -1;
+            }
+        }
+        (void)laps_seen;
         for (int i = 0; i < av * 4; i += 4) {
             double I, Q;
             if (fmt8) { I = (int8_t)s_chunk[i + 3]; Q = (int8_t)s_chunk[i + 1]; }
@@ -364,6 +497,13 @@ static void stream(int src, int ms, int baud)
     printf("stream src %d fs %lu spi %d Hz: %lld words in %lld ms = %.1f kS/s (%.1f%% of fs), reads %lld, max avail %d, laps %lld, bogus %lld, bad ptr %lld, spi busy %.0f%%, mean |iq|^2 %.1f\n",
            src, (unsigned long)fs, espdev_get_speed(), words, dt / 1000, words * 1000.0 / dt, words * 1e8 / dt / fs, reads, maxav, laps, bogus, bad,
            tspi * 100.0 / dt, np ? p / np : 0);
+    printf("stale: %lld words (%.3f%%) equal to last lap, burst %d B, chunk %d\n",
+           stale, words > RING_WORDS ? stale * 100.0 / (words - RING_WORDS) : 0.0, s_burst, s_chunk_target);
+    if (stale) {
+        print_hist("stale by ring pos mod 64", s_stale_mod, 64);
+        print_hist("stale by offset in read", s_stale_off, 64);
+        print_hist("stale run lengths", s_runs, 32);
+    }
     if (steps) {
         double mean = step_sum / steps;
         printf("phase: mean step %.4f rad = %+.1f Hz, jumps >0.6 rad: %lld at read edges (of %lld edges), %lld inside\n",
@@ -391,7 +531,7 @@ static void handle(char *line)
     const char *c = argv[0];
     if (!strcmp(c, "help")) {
         puts("ver | start | stop | tune <hz0> [hz1] | spi <hz> | cap <src> [b64] | sweep | ring <src> [polls] [us]\n"
-             "stream <src> [ms] | pcstream <src> [ms] [baud] | rd <addr> | wr <addr> <val> | rdb <addr> <n>");
+             "stream <src> [ms] | pcstream <src> [ms] [baud] | chunk [n] | rd <addr> | wr <addr> <val> | rdb <addr> <n>");
     } else if (!strcmp(c, "ver")) {
         int v = read_version();
         printf("SX1302 version 0x%02X (v%d.%d)\n", v & 0xFF, (v >> 4) & 15, v & 15);
@@ -424,6 +564,26 @@ static void handle(char *line)
         }
     } else if (!strcmp(c, "ring") && argc >= 2) {
         ring(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 200, argc >= 4 ? atoi(argv[3]) : 0);
+    } else if (!strcmp(c, "capx") && argc >= 3) {
+        int src = atoi(argv[1]) & 31;
+        int e = capture_load(src, atoi(argv[2]));
+        if (!e) { stats(src); if (argc >= 4) b64_dump(src); }
+        else printf("capx failed %d\n", e);
+    } else if (!strcmp(c, "burst")) {
+        if (argc >= 2) { int n = atoi(argv[1]) & ~3; s_burst = n < 4 ? 4 : n > 1024 ? 1024 : n; }
+        if (argc >= 3) s_gap_us = atoi(argv[2]);
+        if (argc >= 4) s_page_per_burst = atoi(argv[3]) != 0;
+        printf("burst %d bytes, gap %d us, page per burst %d\n", s_burst, s_gap_us, s_page_per_burst);
+    } else if (!strcmp(c, "capxsize") && argc >= 2) {
+        int n = atoi(argv[1]);
+        s_load_bytes = n < 4 ? 4 : n > 1024 ? 1024 : n;
+        printf("capx burst %d bytes\n", s_load_bytes);
+    } else if (!strcmp(c, "chunk")) {
+        if (argc >= 2) {
+            int n = atoi(argv[1]);
+            s_chunk_target = n < 32 ? 32 : n > RING_WORDS - 512 ? RING_WORDS - 512 : n;
+        }
+        printf("chunk %d samples\n", s_chunk_target);
     } else if (!strcmp(c, "stream") && argc >= 2) {
         stream(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 2000, 0);
     } else if (!strcmp(c, "pcstream") && argc >= 2) {

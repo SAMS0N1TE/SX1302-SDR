@@ -28,9 +28,10 @@ All integers are little endian.
 | 0x10 | I/Q, signed 8-bit pairs (channel sources 10 to 17) |
 | 0x11 | I/Q, signed 16-bit pairs |
 | 0x12 | u32 samples lost in a ring overrun; the next frame's index skips them |
+| 0x13 | erasure: u32 first sample, u16 count; those samples repeat the previous ring lap |
 | 0x1F | end: u64 samples, u32 overruns, u32 pointer glitches, u32 ms, u32 sample rate |
 
-A gap shows as a 0x12 frame or as an index that does not follow on from the previous frame.
+A gap shows as a 0x12 frame or as an index that does not follow on from the previous frame. Erasure frames arrive before the data frame that holds those samples. `sx1302_stream.py` writes them to `FILE.erasures`, one `first_sample count` per line. About 3% of samples are erased, see [capture-ram.md](capture-ram.md#missed-writes-while-streaming).
 
 ## Rates
 

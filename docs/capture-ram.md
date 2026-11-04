@@ -57,6 +57,33 @@ With CAPTUREWRAP set, the write pointer free-runs at the source rate and wraps e
 
 With a CW tone in channel 2, a 10 s stream showed no phase jumps at any of its 16,132 read boundaries, so no sample was lost or repeated between reads.
 
+## Missed writes while streaming
+
+The capture engine sometimes skips writes while the host reads the capture RAM over SPI. The pointer still advances, so the skipped positions keep the sample from one lap (4096 samples) earlier. One-shot captures read after the fill do not have this.
+
+| Load during a one-shot capture | Bad samples |
+| --- | --- |
+| none | 0 of 24,576 |
+| register polls | 0 of 16,384 |
+| 1 KB bursts from the RX buffer (page 0) | 0 of 16,384 |
+| page 1 selected, no reads | 0 of 12,288 |
+| 1 KB bursts from the capture RAM | runs of 64 |
+| 512, 256, 128, 64, 32 byte bursts | runs of 32, 16, 8, 4, 2 |
+
+A run lasts exactly as long as the burst that caused it. In a stream about one read in eight is affected, and in that read every sample written during its bursts is lost. The share of lost samples stays near 3% whatever the burst size, gap between bursts, chunk size, SPI clock (8, 16 or 20 MHz), page switching per burst, or with the AGC and ARB MCUs held in reset:
+
+| SPI | Chunk | Burst | Lost |
+| ---: | ---: | ---: | ---: |
+| 16 MHz | 32 | 1024 B | 3.37% |
+| 16 MHz | 256 | 128 B, page per burst | 3.10% |
+| 16 MHz | 1024 | 1024 B | 2.98% |
+| 8 MHz | 256 | 1024 B | 2.71% |
+| 20 MHz | 256 | 1024 B | 3.19% |
+
+`CLOCK_GATE_OVERRIDE` (0x6008) values 1, 2 and 3 make no difference; 0 stops the capture.
+
+The firmware detects these samples exactly: a word equal to the one read at the same position on the previous lap is stale. `stream` reports the count and `pcstream` sends each run as an erasure frame. In an 8 s CW recording, 1,563 of 1,568 phase jumps fell on a flagged erasure.
+
 ## SPI
 
 | Clock | 16 KB read | Data |
@@ -69,8 +96,8 @@ With a CW tone in channel 2, a 10 s stream showed no phase jumps at any of its 1
 
 Measured on jumper wires, CRC of a static buffer compared across clocks.
 
-## Interference
+## Wideband impulses
 
-Polling the chip over SPI while a capture runs puts impulses into the samples. One-shot captures wait out the fill time before polling; with that, the wideband captures stopped clipping (rms fell from about 8300 to 5100 counts). Streaming still reads during capture; about 0.17% of phase steps in a CW stream jump inside a read. The firmware uses the weakest GPIO drive on SCK, MOSI and CS.
+Polling the chip over SPI while a 4 MS/s capture runs put impulses into the samples. One-shot captures wait out the fill time before polling; with that, the wideband captures stopped clipping (rms fell from about 8300 to 5100 counts). The firmware uses the weakest GPIO drive on SCK, MOSI and CS.
 
 There is a fixed spur at 904.000 MHz on both radios.
