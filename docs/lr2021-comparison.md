@@ -15,4 +15,4 @@ How the SX1302 on a WM1302 module compares with the LR2021 in [LR2021-SDR](https
 | On-chip processing shown | FFT, sweep, LoRa scan, down-conversion | a counter program in the AGC MCU |
 | Transmit | bursts of custom I/Q | not tried |
 
-Measured with the same HackRF CW tone at 904.330 MHz for the SX1302 rows.
+Measured with the same HackRF CW tone at 904.330 MHz for the SX1302 rows. With the radios tuned to 433.9 MHz, `lgw_start` succeeds, but a 433.93 MHz tone at 20 dB more drive did not show on any source: on the US915 module the front end limits reception to its band.
