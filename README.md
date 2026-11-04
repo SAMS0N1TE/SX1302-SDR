@@ -2,21 +2,23 @@
 
 Raw I/Q from a Semtech SX1302 LoRa gateway chip on an ESP32-P4.
 
-The SX1302 has a 16 KB capture RAM that its own HAL only uses for one-shot test dumps. SX1302-SDR runs that RAM as a ring buffer and reads it continuously over SPI, so a gateway module becomes a 125 kS/s receiver per channel, with 4 MS/s snapshots of each radio.
+One US915 WM1302 monitored **156.250 MHz and 433.920 MHz at the same time**. In a 48-second shielded-bench recording, each receiver recovered four CRC-checked payloads from its own band. The two radio centers stayed fixed while one HackRF sent the payload trains in succession.
 
-## Results
+![Measured four-tone energy on both receivers over 48 seconds](docs/images/split-band-156-433.png)
 
-- Continuous 125 kS/s I/Q from any of the 8 LoRa channels with no ring overruns (10 s runs, 0 laps, 0 phase jumps at 16,132 SPI read boundaries).
-- About 3% of streamed samples are writes the chip skipped while SPI was reading its RAM. The firmware detects each one and flags it as an erasure.
-- Streams to a computer over the board's USB UART at 3 Mbaud: 1,249,918 samples in 10 s, 0 CRC, sequence or index errors.
-- 4 MS/s 16-bit I/Q snapshots from each SX1250 radio, 4096 samples each.
-- 1 MS/s snapshots from the radio A path.
-- Two sources at once: both radios at 4 MS/s, or two channels, sampled at the same instants.
-- A CW test tone shows on both radios at the correct offset, 45 dB above the noise wideband and 60 dB in a 125 kHz channel.
-- SPI reads bit-exact up to 20 MHz on jumper wires (the HAL uses 2 MHz).
-- The chip's AGC and ARB MCUs run the PIC16 instruction set. A test program of ours runs on the AGC MCU at 16 million instruction cycles per second, see [research/mcu](research/mcu/README.md).
+[Bench results, signed I/Q waveforms and measurement controls](docs/dual-band-bench.md) · [Download sample data and reproduce the figures](research/dual-band/README.md)
 
-<p align="center"><img src="docs/images/tone-904330-captures.png" width="64%"> <img src="docs/images/waterfall-src12-tone.png" width="32%"></p>
+## Receiver capabilities
+
+| Mode | Measured on the WM1302 |
+| --- | --- |
+| Two continuous channels | Two of eight IF channels at 125 kS/s each. Both lanes occupy the same device sample index. |
+| Wider continuous channel | Radio A at 250 kS/s, signed 8-bit I/Q. A +160 kHz input aliases to −90 kHz at this rate. |
+| Triggered capture | Activity on either radio freezes 2,048 simultaneous I/Q pairs, including pre-trigger history. Overlapping bursts at 903 and 915 MHz preserved their programmed 1.536 ms delay. |
+| Wide snapshots | One radio at 4 MS/s for 4,096 samples, or both radios at 4 MS/s for 2,048 instants. Source 9 also supports 1 MS/s snapshots. |
+| Programmable cores | Both AGC and ARB execute uploaded PIC16-style code. A custom AGC routine can latch RF activity independently on both chains. [MCU experiments](research/mcu/README.md) |
+
+The 48-second recording had zero device ring overruns. The host received 99.64% of the device pairs, with 21 UART CRC errors. About 6.2% of comparable pairs equaled the previous ring lap. The recorder saves discontinuity and erasure sidecars for analysis.
 
 ## Hardware
 
@@ -67,6 +69,10 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 | `ring <src> [polls] [us]` | wrap mode, prints the write pointer as it moves |
 | `stream <src> [ms]` | continuous ring read, reports rate, laps and phase continuity |
 | `pcstream <src> [ms] [baud]` | continuous ring read sent to the host, see [docs/stream-protocol.md](docs/stream-protocol.md) |
+| `pcdual <a> <b> <ms> <baud>` | stream two IF channels in IA, QA, IB, QB order |
+| `wide <rate> <ms> [baud]` | sample radio A source 9 at 125, 200 or 250 kS/s |
+| `watch <mask> <post_us> <timeout_ms>`, `event` | freeze and retrieve a paired window with the AGC latch loaded |
+| `probetune <rfA_hz> <rfB_hz> <calibration_hz>` | use a separate image-calibration table frequency for experimental tuning |
 | `chunk [n]`, `burst [bytes] [gap_us] [page]` | stream read pattern |
 | `capx <src> <load> [b64]`, `capxsize <bytes>` | one-shot capture with SPI load during the fill |
 | `cap2 <a> <b> [b64]` | one-shot capture of two sources (2k x 64) |
@@ -79,7 +85,8 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 
 - `tools/sx1302_console.py PORT cmd [wait] ...` sends console commands.
 - `tools/sx1302_grab.py PORT OUTDIR src[:count] ...` pulls captures, saves `.npy` and spectrum plots.
-- `tools/sx1302_stream.py PORT SRC SECONDS [--png FILE]` records a continuous stream to `.cs8` or `.cs16` and draws a waterfall.
+- `tools/sx1302_stream.py PORT 12 10 --pair 15 --out two-radios.pair8` records two zero-IF channels. Use `PORT 9 10 --wide-rate 250000` for wider radio-A capture.
+- `tools/sx1302_watch.py PORT --a 903000000 --b 915000000 --post-us 8000 --out burst.npz` arms the dual-radio trigger. Run with quiet channels for threshold estimation. On exit the script reloads the stock cores at the probe defaults of 904.300 and 905.000 MHz.
 - `tools/sx1302_cap2.py PORT A B` takes a two-source capture and reports both halves.
 - `tools/sx1302_mcu_disasm.py FILE.var [--stats]` disassembles an MCU image from the HAL.
 
@@ -89,9 +96,9 @@ See [docs/capture-ram.md](docs/capture-ram.md) for the capture sources, sample f
 
 ## Limits
 
-- Only channel taps (125 kS/s) stream continuously; 1 MS/s needs about 32 Mb/s of SPI reads.
-- Streams carry about 3% erasures (see [docs/capture-ram.md](docs/capture-ram.md#missed-writes-while-streaming)). Snapshots have none.
-- The module's SAW filters limit reception to its band (902 to 928 MHz on US915).
+- Native 1 MS/s source-9 words require about 32 Mb/s before SPI overhead. The 250 kS/s mode subsamples that source without adding an anti-alias filter.
+- Whole-word equality across laps flags likely missed writes. Single-channel captures showed roughly 3% equality and wider or paired streams roughly 6% in the reported runs. Isolated equal values can occur by chance.
+- Seeed specifies 902–928 MHz for this US915 module. Reception beyond that range was demonstrated at particular frequencies with nearby caged signals. Absolute sensitivity and field range are unmeasured. [Frequency sweep and controls](docs/dual-band-bench.md#frequency-coverage)
 - The 8-bit channel taps clip on strong signals.
 - SPI traffic couples into the receiver on jumper wires; keep the leads short.
 

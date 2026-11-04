@@ -89,19 +89,5 @@ if a.stats:
     # branch targets: inside the program and on a used word (low 11 bits plus PCLATH page unknown)
     hits = sum(1 for _, _, t in targets if any(used[(page << 11) | t] for page in (0, 1)))
     print(f"CALL/GOTO {len(targets)}, target used on page 0 or 1: {hits}", file=sys.stderr)
-    # check bits: test parity of bit groups
-    best = []
-    for split in range(1, 14):
-        for mode in ("even", "odd"):
-            def par(x):
-                return bin(x).count("1") & 1
-            ok = 0
-            for w, c in zip(ops, chk):
-                hi = par(w >> split); lo = par(w & ((1 << split) - 1))
-                if mode == "odd":
-                    hi ^= 1; lo ^= 1
-                ok += (c == (hi << 1 | lo))
-            best.append((ok, split, mode))
-    best.sort(reverse=True)
-    ok, split, mode = best[0]
-    print(f"check bits: best fit bit15 = {mode} parity of bits 13:{split}, bit14 = {mode} parity of bits {split - 1}:0, matches {ok}/4096", file=sys.stderr)
+    matches = sum(check == (op.bit_count() & 3) for op, check in zip(ops, chk))
+    print(f"check bits match instruction popcount modulo four: {matches}/{len(ops)}", file=sys.stderr)

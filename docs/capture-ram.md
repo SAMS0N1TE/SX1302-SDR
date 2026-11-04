@@ -93,7 +93,7 @@ A run lasts exactly as long as the burst that caused it. In a stream about one r
 
 `CLOCK_GATE_OVERRIDE` (0x6008) values 1, 2 and 3 make no difference; 0 stops the capture.
 
-The firmware detects these samples exactly: a word equal to the one read at the same position on the previous lap is stale. `stream` reports the count and `pcstream` sends each run as an erasure frame. In an 8 s CW recording, 1,563 of 1,568 phase jumps fell on a flagged erasure.
+The firmware flags words equal to the same position on the previous lap. Long identical runs are strong evidence of missed writes. Quiet one-shot controls also produced isolated matches, so equality alone cannot classify every sample. `stream` reports the count and `pcstream` sends each run as an erasure frame. In an 8 s CW recording, 1,563 of 1,568 phase jumps fell on a flagged erasure.
 
 ## SPI
 

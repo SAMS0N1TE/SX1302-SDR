@@ -38,6 +38,15 @@ static const uint32_t s_fs[32] = {4e6, 4e6, 4e6, 4e6, 4e6, 4e6, 4e6, 0, 0, 1e6, 
 static uint8_t s_buf[CAP_SIZE];
 static uint32_t s_rf0 = 904300000, s_rf1 = 905000000;
 static int s_started;
+static uint32_t s_cal_anchor;
+
+/* Only the image-rejection calibration table selection changes. The RF
+   synthesizer and channelizer still receive the requested frequencies. */
+extern int __real_sx1250_calibrate(uint8_t chain, uint32_t hz);
+int __wrap_sx1250_calibrate(uint8_t chain, uint32_t hz)
+{
+    return __real_sx1250_calibrate(chain, s_cal_anchor ? s_cal_anchor : hz);
+}
 
 static void hw_reset(void)
 {
@@ -102,13 +111,13 @@ static int do_start(void)
 }
 
 /* One-shot capture into s_buf, as test_loragw_capture_ram.c does. */
-static int capture(int src, int wrap)
+static int capture_at_rate(int src, int wrap, uint32_t fs, int second)
 {
-    uint32_t fs = s_fs[src & 31];
     uint16_t period = fs ? (uint16_t)(32e6 / fs - 1) : 0;
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_ENABLE, 1);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, wrap);
-    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, 0);
+    lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, second >= 0);
+    if (second >= 0) lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_SOURCE_B_SOURCEMUX, second);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_SOURCE_A_SOURCEMUX, src);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_0_CAPTUREPERIOD, period & 0xFF);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_PERIOD_1_CAPTUREPERIOD, (period >> 8) & 0xFF);
@@ -133,15 +142,23 @@ static int capture(int src, int wrap)
     return e;
 }
 
+static int capture(int src, int wrap)
+{
+    return capture_at_rate(src, wrap, s_fs[src & 31], -1);
+}
+
 /* One-shot capture with deliberate SPI load while the RAM fills:
    mode 0 quiet, 1 single-register polls, 2 1 KB bursts from the RX buffer
    (0x4000, page 0), 3 1 KB bursts from the capture RAM (page 1). */
 static uint8_t s_junk[1024];
 static int s_load_bytes = 1024;
+static int ring_wptr(void);
+
 static int capture_load(int src, int mode)
 {
     uint32_t fs = s_fs[src & 31];
     if (!fs) return -1;
+    if ((mode == 6 || mode == 7) && (fs != 125000 || espdev_get_speed() != 16000000)) return -3;
     uint16_t period = (uint16_t)(32e6 / fs - 1);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_ENABLE, 1);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
@@ -159,6 +176,15 @@ static int capture_load(int src, int mode)
         else if (mode == 3) {
             lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
             lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, 0x3C00, s_junk, (uint16_t)s_load_bytes);
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+        } else if (mode == 6 || mode == 7) {
+            /* At 125 kS/s a 1 KiB read at 16 MHz spans about 65 writer
+               positions. Leave 256 words before each half boundary. */
+            int w = ring_wptr();
+            if (w < 0 || (w & 2047) >= 1792) continue;
+            int half = (w >> 11) ^ (mode == 7);
+            lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+            lgw_com_rb(LGW_SPI_MUX_TARGET_SX1302, half * 8192 + 4096, s_junk, (uint16_t)s_load_bytes);
             lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
         } else if (mode == 4) {
             /* page 1 held for as long as a burst of s_load_bytes would take, no reads */
@@ -218,8 +244,8 @@ static int capture2(int sa, int sb)
 }
 
 /* Load a small program into the AGC MCU (a PIC16-style core, 4096 x 14-bit
-   words; bit 14 of each stored word is even parity of bits 13:0, bit 15 is
-   not understood yet). The test program counts in file register 0x1B, which
+   words; the upper two bits store popcount(op) modulo four; this test can
+   force bit 15 to exercise the parity flag). The test program counts in file register 0x1B, which
    the host reads as AGC status (0x5781):
        000 CLRF 0x1B / 001 CLRF 0x22 / 002 DECFSZ 0x22,F / 003 GOTO 002
        004 INCF 0x1B,F / 005 GOTO 002
@@ -351,6 +377,54 @@ static int ring_wptr(void)
     return -2;
 }
 
+/* Freeze a 2k-pair IF ring when the loaded two-chain AGC detector latches
+   an event. The PC can request the frozen RAM image after the burst ends. */
+static bool s_event_ready;
+
+static void watch_event(int mask, int post_us, int timeout_ms)
+{
+    s_event_ready = false;
+    if (!s_started || mask < 1 || mask > 3 || post_us < 0 || post_us > 14000 ||
+        timeout_ms < 1 || timeout_ms > 60000) {
+        puts("WATCH invalid parameters or radio stopped");
+        return;
+    }
+    int32_t status = 0;
+    int trigger = -1, stop = -1, matched = 0;
+    if (capture_at_rate(12, 1, 125000, 15)) { puts("WATCH arm error"); return; }
+    vTaskDelay(pdMS_TO_TICKS(20)); /* one full 16.384 ms pre-trigger window */
+    int error = lgw_reg_r(SX1302_REG_AGC_MCU_MCU_AGC_STATUS_MCU_AGC_STATUS, &status);
+    bool stale = (status >> 4) & mask;
+    if (!error && !stale) {
+        puts("WATCH ARMED"); fflush(stdout);
+        int64_t end = esp_timer_get_time() + 1000LL * timeout_ms;
+        while (esp_timer_get_time() < end) {
+            error = lgw_reg_r(SX1302_REG_AGC_MCU_MCU_AGC_STATUS_MCU_AGC_STATUS, &status);
+            if (error) break;
+            matched = (status >> 4) & mask;
+            if (matched) {
+                trigger = ring_wptr();
+                esp_rom_delay_us(post_us);
+                break;
+            }
+            vTaskDelay(1);
+        }
+    }
+    error |= lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
+    stop = ring_wptr();
+    error |= lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
+    error |= lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, 0);
+    if (error || stale || !matched || trigger < 0 || stop < 0) {
+        printf("WATCH end error=%d stale=%d matched=%d trigger=%d stop=%d\n",error,stale,matched,trigger,stop);
+        return;
+    }
+    error = lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 1);
+    if (!error) error = lgw_mem_rb(0, s_buf, CAP_SIZE, false);
+    error |= lgw_reg_w(SX1302_REG_COMMON_PAGE_PAGE, 0);
+    s_event_ready = !error;
+    printf("WATCH frozen=%d mask=%d trigger=%d stop=%d\n",s_event_ready,matched,trigger & 2047,stop & 2047);
+}
+
 /* Continuous read of the capture ring in wrap mode. Reads [rd, wptr) each
    pass; a lap is flagged when the time since the last read implies the
    writer could have overtaken us (> ring size minus a margin). */
@@ -363,6 +437,7 @@ static uint8_t s_chunk[RING_WORDS * 4];
 #define FR_IQ16 0x11
 #define FR_GAP  0x12
 #define FR_STALE 0x13
+#define FR_PAIR8 0x14
 #define FR_END  0x1F
 static uint8_t s_frame[12 + 4096 + 4];
 static uint16_t s_seq;
@@ -423,13 +498,15 @@ static void print_hist(const char *name, const uint32_t *h, int n)
     printf("\n");
 }
 
-static void stream(int src, int ms, int baud)
+static void stream(int src, int ms, int baud, uint32_t fs, int pack_iq8, int second)
 {
-    uint32_t fs = s_fs[src & 31];
     if (!fs) { puts("no fs for that source"); return; }
-    int fmt8 = (src >= 10 && src <= 17);
+    const int dual = second >= 0;
+    const int stride = dual ? 2 : 1; /* 32-bit RAM words per sample instant */
+    const int capacity = RING_WORDS / stride;
+    int fmt8 = pack_iq8 || (src >= 10 && src <= 17);
     if (baud) {
-        printf("PCSTREAM %d %lu %d %s\n", src, (unsigned long)fs, baud, fmt8 ? "iq8" : "iq16");
+        printf("PCSTREAM %d %lu %d %s\n", src, (unsigned long)fs, baud, dual ? "pair8" : fmt8 ? "iq8" : "iq16");
         fflush(stdout);
         uart_wait_tx_done(UART_NUM_0, pdMS_TO_TICKS(200));
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -437,8 +514,12 @@ static void stream(int src, int ms, int baud)
         vTaskDelay(pdMS_TO_TICKS(50));
         s_seq = 0;
     }
-    if (capture(src, 1)) { puts("ring start failed"); return; }
+    if (capture_at_rate(src, 1, fs, second)) { puts("ring start failed"); return; }
     int rd = ring_wptr();
+    if (rd < 0) rd = 0;
+    /* In 2k x 64 mode the counter advances once per pair. Bit 11
+       continues counting through the physical 2048-pair wrap. */
+    rd &= capacity - 1;
     uint32_t index = 0;
     memset(s_lap, 0xA5, sizeof s_lap);
     memset(s_stale_mod, 0, sizeof s_stale_mod);
@@ -465,10 +546,11 @@ static void stream(int src, int ms, int baud)
         if (wait_us > 0) esp_rom_delay_us((uint32_t)wait_us);
         int w = ring_wptr();               /* page 0 */
         if (w < 0) { bad++; continue; }
+        w &= capacity - 1;
         int64_t now = esp_timer_get_time();
-        int av = (w - rd) & (RING_WORDS - 1);
+        int av = (w - rd) & (capacity - 1);
         double expect = (double)(now - tread) * fs / 1e6;  /* words written since our last read */
-        if ((double)(now - tlast) * fs / 1e6 > RING_WORDS - 256) {
+        if ((double)(now - tlast) * fs / 1e6 > capacity - 256 / stride) {
             /* Overrun: resync to the writer and tell the host how much was lost. */
             laps++;
             uint32_t lost = (uint32_t)expect;
@@ -483,19 +565,20 @@ static void stream(int src, int ms, int baud)
         if (av > maxav) maxav = av;
         int64_t ts = esp_timer_get_time();
         int first = av;
-        if (rd + first > RING_WORDS) first = RING_WORDS - rd;
-        ring_read(rd, s_chunk, first);
-        if (first < av) ring_read(0, s_chunk + first * 4, av - first);
+        if (rd + first > capacity) first = capacity - rd;
+        ring_read(rd * stride, s_chunk, first * stride);
+        if (first < av) ring_read(0, s_chunk + first * 4 * stride, (av - first) * stride);
         tread = now;
         tspi += esp_timer_get_time() - ts;
         int run_start = -1;
         for (int k = 0; k <= av; k++) {
             int is_stale = 0;
             if (k < av) {
-                int pos = (rd + k) & (RING_WORDS - 1);
-                uint32_t wv; memcpy(&wv, s_chunk + 4 * k, 4);
-                is_stale = words + k >= RING_WORDS && wv == s_lap[pos];
-                s_lap[pos] = wv;
+                int pos = (rd + k) & (capacity - 1);
+                const uint8_t *sample = s_chunk + k * 4 * stride;
+                uint32_t *prior = s_lap + pos * stride;
+                is_stale = words + k >= capacity && !memcmp(prior, sample, 4 * stride);
+                memcpy(prior, sample, 4 * stride);
                 if (is_stale) {
                     stale++;
                     s_stale_mod[pos & 63]++;
@@ -517,7 +600,8 @@ static void stream(int src, int ms, int baud)
             }
         }
         (void)laps_seen;
-        for (int i = 0; i < av * 4; i += 4) {
+        /* The wide reader needs this CPU time to drain the ring before wrap. */
+        for (int i = 0; !pack_iq8 && !dual && i < av * 4; i += 4) {
             double I, Q;
             if (fmt8) { I = (int8_t)s_chunk[i + 3]; Q = (int8_t)s_chunk[i + 1]; }
             else { I = (int16_t)(s_chunk[i + 2] | s_chunk[i + 3] << 8); Q = (int16_t)(s_chunk[i] | s_chunk[i + 1] << 8); }
@@ -537,14 +621,14 @@ static void stream(int src, int ms, int baud)
         }
         if (baud) {
             int64_t tu = esp_timer_get_time();
-            int per = fmt8 ? 2048 : 1024;        /* samples per frame, 4 KB max */
+            int per = fmt8 && !dual ? 2048 : 1024;        /* samples per frame, 4 KB max */
             for (int s0 = 0; s0 < av; s0 += per) {
                 int n = av - s0 < per ? av - s0 : per;
                 uint8_t *o = s_frame + 12;
-                const uint8_t *in = s_chunk + s0 * 4;
+                const uint8_t *in = s_chunk + s0 * 4 * stride;
                 if (fmt8) {
-                    for (int k = 0; k < n; k++) { o[2 * k] = in[4 * k + 3]; o[2 * k + 1] = in[4 * k + 1]; }
-                    send_frame(FR_IQ8, index + s0, s_frame + 12, (uint16_t)(n * 2));
+                    for (int k = 0; k < n * stride; k++) { o[2 * k] = in[4 * k + 3]; o[2 * k + 1] = in[4 * k + 1]; }
+                    send_frame(dual ? FR_PAIR8 : FR_IQ8, index + s0, s_frame + 12, (uint16_t)(n * 2 * stride));
                 } else {
                     for (int k = 0; k < n; k++) {
                         o[4 * k] = in[4 * k + 2]; o[4 * k + 1] = in[4 * k + 3];
@@ -556,12 +640,13 @@ static void stream(int src, int ms, int baud)
             tuart += esp_timer_get_time() - tu;
         }
         index += av;
-        rd = (rd + av) & (RING_WORDS - 1);
+        rd = (rd + av) & (capacity - 1);
         words += av; reads++;
     }
     int64_t dt = esp_timer_get_time() - t0;
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTURESTART, 0);
     lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_CAPTUREWRAP, 0);
+    if (dual) lgw_reg_w(SX1302_REG_CAPTURE_RAM_CAPTURE_CFG_RAMCONFIG, 0);
     if (baud) {
         uint8_t e[24];
         put32(e, (uint32_t)words); put32(e + 4, (uint32_t)(words >> 32));
@@ -574,11 +659,13 @@ static void stream(int src, int ms, int baud)
         vTaskDelay(pdMS_TO_TICKS(100));
         printf("uart busy %.0f%%\n", tuart * 100.0 / dt);
     }
-    printf("stream src %d fs %lu spi %d Hz: %lld words in %lld ms = %.1f kS/s (%.1f%% of fs), reads %lld, max avail %d, laps %lld, bogus %lld, bad ptr %lld, spi busy %.0f%%, mean |iq|^2 %.1f\n",
+    printf("stream src %d fs %lu spi %d Hz: %lld words in %lld ms = %.1f kS/s (%.1f%% of fs), reads %lld, max avail %d, laps %lld, bogus %lld, bad ptr %lld, spi busy %.0f%%",
            src, (unsigned long)fs, espdev_get_speed(), words, dt / 1000, words * 1000.0 / dt, words * 1e8 / dt / fs, reads, maxav, laps, bogus, bad,
-           tspi * 100.0 / dt, np ? p / np : 0);
+           tspi * 100.0 / dt);
+    if (np) printf(", mean |iq|^2 %.1f", p / np);
+    puts("");
     printf("stale: %lld words (%.3f%%) equal to last lap, burst %d B, chunk %d\n",
-           stale, words > RING_WORDS ? stale * 100.0 / (words - RING_WORDS) : 0.0, s_burst, s_chunk_target);
+           stale, words > capacity ? stale * 100.0 / (words - capacity) : 0.0, s_burst, s_chunk_target);
     if (stale) {
         print_hist("stale by ring pos mod 64", s_stale_mod, 64);
         print_hist("stale by offset in read", s_stale_off, 64);
@@ -609,9 +696,18 @@ static void handle(char *line)
     for (char *p = strtok(line, " \t\r\n"); p && argc < 6; p = strtok(NULL, " \t\r\n")) argv[argc++] = p;
     if (!argc) return;
     const char *c = argv[0];
+    if (strcmp(c, "event") && strcmp(c, "ver") && strcmp(c, "help")) s_event_ready = false;
     if (!strcmp(c, "help")) {
+        puts("probetune <rfA_hz> <rfB_hz> <calibration_hz>");
+        puts("watch <mask> <post_us> <timeout_ms> | event (requires loaded AGC latch)");
+        puts("pcdual <srcA> <srcB> <ms> <baud> (125000 pairs/s)");
+        puts("wide <125000|200000|250000> <ms> [baud] (radio A, iq8)");
         puts("ver | start | stop | tune <hz0> [hz1] | spi <hz> | cap <src> [b64] | sweep | ring <src> [polls] [us]\n"
              "stream <src> [ms] | pcstream <src> [ms] [baud] | chunk [n] | rd <addr> | wr <addr> <val> | rdb <addr> <n>");
+    } else if (!strcmp(c, "watch") && argc == 4) {
+        watch_event(atoi(argv[1]), atoi(argv[2]), atoi(argv[3]));
+    } else if (!strcmp(c, "event")) {
+        if (s_event_ready) b64_dump(12); else puts("no frozen event");
     } else if (!strcmp(c, "ver")) {
         int v = read_version();
         printf("SX1302 version 0x%02X (v%d.%d)\n", v & 0xFF, (v >> 4) & 15, v & 15);
@@ -620,12 +716,20 @@ static void handle(char *line)
     } else if (!strcmp(c, "stop")) {
         printf("lgw_stop -> %d\n", lgw_stop());
         s_started = 0;
-    } else if (!strcmp(c, "tune") && argc >= 2) {
+    } else if ((!strcmp(c, "tune") && argc >= 2) ||
+               (!strcmp(c, "probetune") && argc == 4)) {
+        uint32_t anchor = !strcmp(c, "probetune") ? strtoul(argv[3], NULL, 0) : 0;
+        if (!strcmp(c, "probetune") && (anchor == 0 || !strcmp(argv[3], "0"))) {
+            puts("probetune needs a calibration-table frequency"); return;
+        }
         s_rf0 = strtoul(argv[1], NULL, 0);
         s_rf1 = argc >= 3 ? strtoul(argv[2], NULL, 0) : s_rf0 + 700000;
         if (s_started) { lgw_stop(); s_started = 0; }
         hw_reset();
+        s_cal_anchor = anchor;
+        if (anchor) printf("probe RX %lu %lu calibration %lu\n", (unsigned long)s_rf0, (unsigned long)s_rf1, (unsigned long)anchor);
         do_start();
+        s_cal_anchor = 0;
     } else if (!strcmp(c, "spi") && argc >= 2) {
         int e = espdev_set_speed(atoi(argv[1]));
         if (e) printf("set speed failed %d\n", e);
@@ -673,9 +777,19 @@ static void handle(char *line)
         }
         printf("chunk %d samples\n", s_chunk_target);
     } else if (!strcmp(c, "stream") && argc >= 2) {
-        stream(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 2000, 0);
+        int src = atoi(argv[1]) & 31;
+        stream(src, argc >= 3 ? atoi(argv[2]) : 2000, 0, s_fs[src], 0, -1);
     } else if (!strcmp(c, "pcstream") && argc >= 2) {
-        stream(atoi(argv[1]) & 31, argc >= 3 ? atoi(argv[2]) : 10000, argc >= 4 ? atoi(argv[3]) : 3000000);
+        int src = atoi(argv[1]) & 31;
+        stream(src, argc >= 3 ? atoi(argv[2]) : 10000, argc >= 4 ? atoi(argv[3]) : 3000000, s_fs[src], 0, -1);
+    } else if (!strcmp(c, "wide") && argc >= 3) {
+        int fs = atoi(argv[1]);
+        if (fs != 125000 && fs != 200000 && fs != 250000) { puts("use 125000, 200000 or 250000"); return; }
+        stream(9, atoi(argv[2]), argc >= 4 ? atoi(argv[3]) : 0, fs, 1, -1);
+    } else if (!strcmp(c, "pcdual") && argc == 5) {
+        int a = atoi(argv[1]), b = atoi(argv[2]);
+        if (a < 10 || a > 17 || b < 10 || b > 17) { puts("use sources 10..17"); return; }
+        stream(a, atoi(argv[3]), atoi(argv[4]), 125000, 0, b);
     } else if (!strcmp(c, "rd") && argc >= 2) {
         uint8_t v = 0;
         int e = lgw_com_r(LGW_SPI_MUX_TARGET_SX1302, (uint16_t)strtoul(argv[1], NULL, 0), &v);

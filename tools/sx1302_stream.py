@@ -1,6 +1,12 @@
 """Record continuous I/Q from the SX1302-SDR firmware over its USB UART.
 
-usage: sx1302_stream.py PORT SRC SECONDS [--baud 3000000] [--out FILE] [--png FILE]
+usage: sx1302_stream.py PORT SRC SECONDS [--baud BAUD] [--out FILE] [--png FILE]
+       sx1302_stream.py PORT 9 SECONDS --wide-rate 250000
+       sx1302_stream.py PORT 12 SECONDS --pair 13
+
+Pair records are four signed bytes, IA QA IB QB. Wide and pair streams use
+6 Mbaud by default. A .segments sidecar maps file offsets (in sample instants)
+to device indices across transport discontinuities. Erasures use device indices.
 
 Sends 'pcstream SRC MS BAUD', switches the port to BAUD, checks every frame
 (CRC, sequence, sample index) and writes interleaved I/Q: .cs8 for the 8-bit
@@ -13,22 +19,37 @@ ap = argparse.ArgumentParser()
 ap.add_argument("port")
 ap.add_argument("src", type=int)
 ap.add_argument("seconds", type=float)
-ap.add_argument("--baud", type=int, default=3000000)
+ap.add_argument("--baud", type=int)
+ap.add_argument("--wide-rate", type=int, choices=(125000, 200000, 250000), help="sample source 9 at this capture clock, send upper 8 bits of I and Q")
+ap.add_argument("--pair", type=int, choices=range(10, 18), help="second IF source, writes IA QA IB QB for each sample instant")
 ap.add_argument("--out")
 ap.add_argument("--png")
 a = ap.parse_args()
+
+if a.baud is None:
+    a.baud = 6000000 if a.wide_rate or a.pair else 3000000
+if a.wide_rate and a.src != 9:
+    ap.error("--wide-rate requires source 9")
+
+if a.pair and (a.wide_rate or a.src not in range(10, 18) or a.png):
+    ap.error("--pair requires IF sources 10..17 and raw output")
 
 ser = serial.Serial()
 ser.port = a.port; ser.baudrate = 115200; ser.timeout = 0.05
 ser.dtr = False; ser.rts = False
 ser.open()
+if sys.platform == "win32":
+    ser.set_buffer_size(rx_size=1024 * 1024)
 ser.write(b"\r\n"); time.sleep(0.3); ser.read(65536)
 ms = int(a.seconds * 1000)
-ser.write(f"pcstream {a.src} {ms} {a.baud}\r\n".encode())
+cmd = f"wide {a.wide_rate}" if a.wide_rate else f"pcstream {a.src}"
+if a.pair:
+    cmd = f"pcdual {a.src} {a.pair}"
+ser.write(f"{cmd} {ms} {a.baud}\r\n".encode())
 
 line = b""
 end = time.time() + 5
-while b"PCSTREAM" not in line and time.time() < end:
+while not any(row.startswith(b"PCSTREAM ") for row in line.split(b"\n")[:-1]) and time.time() < end:
     line += ser.read(256)
 if b"PCSTREAM" not in line:
     sys.exit("no PCSTREAM reply: " + line.decode("utf-8", "replace"))
@@ -38,11 +59,14 @@ time.sleep(0.05)
 ser.baudrate = a.baud
 ser.reset_input_buffer()
 
-out = a.out or f"sx1302_src{a.src}.{'cs8' if fmt == 'iq8' else 'cs16'}"
+if a.pair and fmt != "pair8":
+    sys.exit("expected pair8 stream")
+out = a.out or (f"sx1302_src{a.src}_{a.pair}.pair8" if a.pair else None) or f"sx1302_src{a.src}.{'cs8' if fmt == 'iq8' else 'cs16'}"
 f = open(out, "wb")
 buf = bytearray()
 frames = bad_crc = seq_err = idx_err = gaps = lost = 0
 samples = 0
+segments = []
 next_seq = None
 next_idx = 0
 endrec = None
@@ -78,8 +102,10 @@ while time.time() < deadline and endrec is None:
         if next_seq is not None and seq != next_seq:
             seq_err += 1
         next_seq = (seq + 1) & 0xFFFF
-        if typ in (0x10, 0x11):
+        if typ in (0x10, 0x11, 0x14):
             n = ln // (2 if typ == 0x10 else 4)
+            if not segments or idx != ((segments[-1][1] + samples - segments[-1][0]) & 0xFFFFFFFF):
+                segments.append((samples, idx))
             if idx != next_idx:
                 idx_err += 1
             f.write(pl)
@@ -96,6 +122,10 @@ while time.time() < deadline and endrec is None:
         elif typ == 0x1F:
             endrec = struct.unpack("<QIIII", pl)
 f.close()
+with open(out + ".segments", "w") as sf:
+    sf.write("# file_sample device_index (first instant of each contiguous segment)\n")
+    for file_sample, device_index in segments:
+        sf.write(f"{file_sample} {device_index}\n")
 dt = time.time() - t0
 ser.baudrate = 115200
 time.sleep(0.5)
