@@ -119,3 +119,5 @@ See [docs/capture-ram.md](docs/capture-ram.md) for the capture sources, sample f
 ## License
 
 MIT, see [LICENSE](LICENSE). The Semtech HAL keeps its own license, see `firmware/esp32p4/components/libloragw/LICENSE.TXT`.
+
+[WM1302 v1.1 bench closeout and unresolved RF path](docs/wm1302-closeout.md)
