@@ -18,6 +18,7 @@ One US915 WM1302 monitored **156.250 MHz and 433.920 MHz at the same time**. In 
 
 | Mode | Measured on the WM1302 |
 | --- | --- |
+| On-device P25 sync search | The P4 ranks 12 repeated Phase 1 voice-frame syncs on radio A, saves a window of I/Q and source 18 energy, and can check a supplied network ID. [Firmware and controls](docs/p25-nano.md) |
 | Two continuous channels | Two of eight IF channels at 125 kS/s each. Both lanes occupy the same device sample index. |
 | Wider continuous channel | Radio A at 250 kS/s, signed 8-bit I/Q. A +160 kHz input aliases to −90 kHz at this rate. |
 | Triggered capture | Activity on either radio freezes 2,048 simultaneous I/Q pairs, including pre-trigger history. Overlapping bursts at 903 and 915 MHz preserved their programmed 1.536 ms delay. |
@@ -78,6 +79,7 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 | `pcdual <a> <b> <ms> <baud>` | stream two IF channels in IA, QA, IB, QB order |
 | `wide <rate> <ms> [baud]` | sample radio A source 9 at 125, 200 or 250 kS/s |
 | `watch <mask> <post_us> <timeout_ms>`, `event` | freeze and retrieve a paired window with the AGC latch loaded |
+| `p25self`, `p25scan <ms> [NAC]`, `p25mix <ms> <amplitude> <seed>` | Digital self-test, live sync search, and test waveform added to live samples on the P4. |
 | `probetune <rfA_hz> <rfB_hz> <calibration_hz>` | use a separate image-calibration table frequency for experimental tuning |
 | `chunk [n]`, `burst [bytes] [gap_us] [page]` | stream read pattern |
 | `capx <src> <load> [b64]`, `capxsize <bytes>` | one-shot capture with SPI load during the fill |

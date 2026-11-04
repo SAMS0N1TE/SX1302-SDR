@@ -498,10 +498,13 @@ static void print_hist(const char *name, const uint32_t *h, int n)
     printf("\n");
 }
 
+#include "p25_sync.h"
+
 static void stream(int src, int ms, int baud, uint32_t fs, int pack_iq8, int second)
 {
     if (!fs) { puts("no fs for that source"); return; }
     const int dual = second >= 0;
+    const bool sync = p25_active();
     const int stride = dual ? 2 : 1; /* 32-bit RAM words per sample instant */
     const int capacity = RING_WORDS / stride;
     int fmt8 = pack_iq8 || (src >= 10 && src <= 17);
@@ -553,6 +556,7 @@ static void stream(int src, int ms, int baud, uint32_t fs, int pack_iq8, int sec
         if ((double)(now - tlast) * fs / 1e6 > capacity - 256 / stride) {
             /* Overrun: resync to the writer and tell the host how much was lost. */
             laps++;
+            if (sync) p25_gap((uint32_t)expect);
             uint32_t lost = (uint32_t)expect;
             if (baud) { uint8_t g[4]; put32(g, lost); send_frame(FR_GAP, index, g, 4); }
             index += lost;
@@ -579,6 +583,7 @@ static void stream(int src, int ms, int baud, uint32_t fs, int pack_iq8, int sec
                 uint32_t *prior = s_lap + pos * stride;
                 is_stale = words + k >= capacity && !memcmp(prior, sample, 4 * stride);
                 memcpy(prior, sample, 4 * stride);
+                if (sync) p25_push((int8_t)sample[3],(int8_t)sample[1],sample[4],is_stale);
                 if (is_stale) {
                     stale++;
                     s_stale_mod[pos & 63]++;
@@ -599,6 +604,7 @@ static void stream(int src, int ms, int baud, uint32_t fs, int pack_iq8, int sec
                 run_start = -1;
             }
         }
+        if (sync) p25_chunk(av);
         (void)laps_seen;
         /* The wide reader needs this CPU time to drain the ring before wrap. */
         for (int i = 0; !pack_iq8 && !dual && i < av * 4; i += 4) {
@@ -700,10 +706,32 @@ static void handle(char *line)
     if (!strcmp(c, "help")) {
         puts("probetune <rfA_hz> <rfB_hz> <calibration_hz>");
         puts("watch <mask> <post_us> <timeout_ms> | event (requires loaded AGC latch)");
+        puts("p25self | p25scan <ms> [NAC] | p25mix <ms> <digital_amplitude> <seed>");
         puts("pcdual <srcA> <srcB> <ms> <baud> (125000 pairs/s)");
         puts("wide <125000|200000|250000> <ms> [baud] (radio A, iq8)");
         puts("ver | start | stop | tune <hz0> [hz1] | spi <hz> | cap <src> [b64] | sweep | ring <src> [polls] [us]\n"
              "stream <src> [ms] | pcstream <src> [ms] [baud] | chunk [n] | rd <addr> | wr <addr> <val> | rdb <addr> <n>");
+    } else if (!strcmp(c, "p25self")) {
+        if (!p25_begin(0, 0)) { puts("sync allocation failed"); return; }
+        p25_self();
+        p25_end(false, -1);
+    } else if ((!strcmp(c, "p25scan") && (argc == 2 || argc == 3)) || (!strcmp(c, "p25mix") && argc == 4)) {
+        int ms = atoi(argv[1]);
+        int amplitude = argc == 4 ? atoi(argv[2]) : 0;
+        unsigned seed = argc == 4 ? strtoul(argv[3], NULL, 0) : 0;
+        if (ms < 4000 || ms > 600000 || amplitude < 0 || amplitude > 100) {
+            puts("sync duration 4000..600000 ms, digital amplitude 0..100 counts"); return;
+        }
+        int nac = argc == 4 ? 0x293 : -1;
+        if (argc == 3) {
+            char *end;
+            long value = strtol(argv[2], &end, 0);
+            if (*end || value < 0 || value > 0xFFF) { puts("invalid 12-bit NAC"); return; }
+            nac = (int)value;
+        }
+        if (!p25_begin(amplitude, seed)) { puts("sync allocation failed"); return; }
+        stream(12, ms, 0, 125000, 1, 18);
+        p25_end(true, nac);
     } else if (!strcmp(c, "watch") && argc == 4) {
         watch_event(atoi(argv[1]), atoi(argv[2]), atoi(argv[3]));
     } else if (!strcmp(c, "event")) {
