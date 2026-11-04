@@ -33,6 +33,18 @@ The SX1302 has two small MCUs, AGC and ARB. `sx1302_hal` loads an 8 KB image int
 
 AGC `main` also writes 0x0A, the firmware version the HAL expects (10), to file 0x20 early on.
 
+The calibration image drives a register port to the radio:
+
+| File register | Use |
+| --- | --- |
+| 0x15 | 8-bit register address |
+| 0x16 | write data |
+| 0x17 bit 0 | write strobe (BSF then BCF) |
+| 0x17 bit 1 | read strobe |
+| 0x0D | read data |
+
+The 8-bit addresses match radio registers, so this is the MCU's link to the SX125x/SX1250, not to the SX1302's own register space.
+
 ## A program of our own
 
 `mcutest [bit15]` loads this into the AGC MCU in place of Semtech's image:

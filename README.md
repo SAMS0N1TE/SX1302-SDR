@@ -85,7 +85,7 @@ UART0 at 115200. The firmware runs `lgw_start` at boot (radio A 904.3 MHz, radio
 
 ## How it works
 
-See [docs/capture-ram.md](docs/capture-ram.md) for the capture sources, sample formats and the ring buffer.
+See [docs/capture-ram.md](docs/capture-ram.md) for the capture sources, sample formats and the ring buffer, and [docs/lr2021-comparison.md](docs/lr2021-comparison.md) for how it compares with the LR2021.
 
 ## Limits
 
