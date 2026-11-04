@@ -1,0 +1,122 @@
+[
+  {
+    "lane": 0,
+    "folded": false,
+    "units": [
+      [
+        "293",
+        "LDU1"
+      ],
+      [
+        "293",
+        "LDU2"
+      ],
+      [
+        "293",
+        "LDU1"
+      ],
+      [
+        "293",
+        "TDU"
+      ],
+      [
+        "293",
+        "LDU2"
+      ]
+    ],
+    "imbe_count": 36,
+    "reference_value_matches": 16,
+    "imbe_sha256": "b1d8b1a6ad581ca58b28c50ec115a963432b3782c91cc3d19a79c6dd5aa2f47f",
+    "errors": {
+      "audio errors": "0",
+      "header errors": "26",
+      "irrecoverable header errors": "3"
+    }
+  },
+  {
+    "lane": 0,
+    "folded": true,
+    "units": [
+      [
+        "293",
+        "LDU1"
+      ],
+      [
+        "293",
+        "LDU2"
+      ],
+      [
+        "293",
+        "TDU"
+      ]
+    ],
+    "imbe_count": 18,
+    "reference_value_matches": 18,
+    "imbe_sha256": "0a3734e15e07fa7a67b6169abe9b4cca18cada0b37dfb1ec3ad4af44b153a37e",
+    "errors": {
+      "audio errors": "0",
+      "header errors": "2",
+      "irrecoverable header errors": "0"
+    }
+  },
+  {
+    "lane": 1,
+    "folded": false,
+    "units": [
+      [
+        "293",
+        "LDU1"
+      ],
+      [
+        "293",
+        "LDU2"
+      ],
+      [
+        "293",
+        "LDU1"
+      ],
+      [
+        "293",
+        "TDU"
+      ],
+      [
+        "293",
+        "LDU2"
+      ]
+    ],
+    "imbe_count": 36,
+    "reference_value_matches": 17,
+    "imbe_sha256": "3b380a98c360efa58e15c001f5c43b32684fc7a67167b3e637f072967641ea20",
+    "errors": {
+      "audio errors": "0",
+      "header errors": "25",
+      "irrecoverable header errors": "4"
+    }
+  },
+  {
+    "lane": 1,
+    "folded": true,
+    "units": [
+      [
+        "293",
+        "LDU1"
+      ],
+      [
+        "293",
+        "LDU2"
+      ],
+      [
+        "293",
+        "TDU"
+      ]
+    ],
+    "imbe_count": 18,
+    "reference_value_matches": 18,
+    "imbe_sha256": "0a3734e15e07fa7a67b6169abe9b4cca18cada0b37dfb1ec3ad4af44b153a37e",
+    "errors": {
+      "audio errors": "0",
+      "header errors": "1",
+      "irrecoverable header errors": "0"
+    }
+  }
+]

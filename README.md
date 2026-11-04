@@ -8,6 +8,12 @@ One US915 WM1302 monitored **156.250 MHz and 433.920 MHz at the same time**. In 
 
 [Bench results, signed I/Q waveforms and measurement controls](docs/dual-band-bench.md) · [Download sample data and reproduce the figures](research/dual-band/README.md)
 
+## Waveform gallery
+
+[![Received P25 Phase 1 raw I/Q, envelope, channel spectrum and waterfall](docs/images/waveform-p25-c4fm.png)](docs/waveform-gallery.md)
+
+[**P25 Phase 1** · recovered 1,011 Hz test tone](docs/waveform-gallery.md#p25-phase-1--same-fixture-different-receiver) · [**Wide chirp** · 4 MS/s raw I/Q](docs/waveform-gallery.md#a-wide-chirp--4-mss-capture-ram) · [**QPSK** · constellation and relative phase](docs/waveform-gallery.md#qpsk--timing-constellation-and-phase)
+
 ## Receiver capabilities
 
 | Mode | Measured on the WM1302 |
